@@ -1,0 +1,18 @@
+target/
+.idea/
+*.iml
+.classpath
+.project
+.settings/
+.DS_Store
+*.log
+.env
+# Harness 运行时产物（记忆 / 会话 / 子 Agent 工作区走 Redis，本地仅可能留下索引）
+workspace/.index/
+workspace/agents/
+workspace/memory/*.md
+!workspace/memory/.gitkeep
+workspace/MEMORY.md
+workspace/sessions/
+workspace/plans/*.md
+!workspace/plans/.gitkeep

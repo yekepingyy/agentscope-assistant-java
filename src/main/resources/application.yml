@@ -1,0 +1,57 @@
+server:
+  port: 8089
+
+spring:
+  application:
+    name: agentscope-assistant-java
+  mvc:
+    async:
+      request-timeout: 330000
+  datasource:
+    url: jdbc:mysql://${MYSQL_HOST:127.0.0.1}:${MYSQL_PORT:3306}/${MYSQL_DATABASE:agentscope_assistant}?useUnicode=true&characterEncoding=UTF-8&connectionCollation=utf8mb4_unicode_ci&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai
+    username: ${MYSQL_USER:root}
+    password: ${MYSQL_PASSWORD:root@kpye@123}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      connection-test-query: SELECT 1
+      maximum-pool-size: 20
+
+# OpenAI 兼容（示例为阿里云百炼 / 智谱均可）
+llm:
+  base-url: https://llm-inr089bfe37yw1si.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+  api-key: sk-ws-H.PDXXPLM.Pt7M.MEQCIH5ZOkzJ97kcORBrgRd2XdBXN7NrcIH_CajXJp13EpP4AiA7gE3ZlVbYsm-ikiNJtNigsevLkfOD46YeSLTlQrsWIw
+  model: qwen3.8-flash
+  temperature: 0.3
+  timeout-seconds: 120
+  enable-thinking: false
+
+mcp:
+    api-key: ${MCP_API_KEY:${LLM_API_KEY:d7ac7f693df6431b90795d3201a7818c.6IITngzTLhbjp0cV}}
+
+agent:
+  workspace: ${user.dir}/workspace
+  max-iters: 80
+  approval-tools: write_file,edit_file
+  # 官方分层记忆（见 AgentScopeConfig.memoryConfig）
+  # flush-throttle-minutes: 0 = 每轮结束都抽取（ALWAYS）；>0 = 节流分钟数
+  memory:
+    flush-throttle-minutes: 0
+    consolidation-min-gap-minutes: 30
+    daily-retention-days: 90
+
+logging:
+  level:
+    cn.deepassistant: INFO
+    io.agentscope: INFO
+
+# 生产必填。AgentState 用官方 MysqlAgentStateStore（表 agentscope_sessions，可自动建）。
+# 库名必须和 spring.datasource.url 一致。工作区 / 网页会话 / 待审批仍进 Redis。
+# Redis ping 或 MySQL 连不上时进程直接退出。
+# 不需要 spring.profiles.active=distributed
+mysql:
+  database: ${MYSQL_DATABASE:agentscope_assistant}
+redis:
+  host: ${REDIS_HOST:127.0.0.1}
+  port: ${REDIS_PORT:6379}
+  password: ${REDIS_PASSWORD:}        # 本地无密码留空
+  database: ${REDIS_DATABASE:0}
