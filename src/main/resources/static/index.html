@@ -192,6 +192,105 @@
   }
   .agent-block { border-color: #3a4a5a; background: #1a2834; color: #9ec9e0; }
   .plan-block { border-color: #5a4a28; background: #2a2418; color: #e8c98a; }
+  .activity {
+    max-width: 820px;
+    margin: 0 0 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .status-row, .think-block, .step-row {
+    color: var(--text-dim);
+    font-size: 13px;
+  }
+  .status-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 2px 8px;
+  }
+  .status-label.live, .think-title.live {
+    background: linear-gradient(90deg, #6d8494 0%, #d7e6ef 45%, #6d8494 90%);
+    background-size: 200% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    animation: shimmer 1.8s linear infinite;
+  }
+  @keyframes shimmer {
+    from { background-position: 100% 0; }
+    to { background-position: -100% 0; }
+  }
+  .spinner {
+    width: 12px;
+    height: 12px;
+    border: 1.5px solid #3a4e5c;
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin .7s linear infinite;
+    flex-shrink: 0;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .step-icon {
+    width: 14px;
+    height: 14px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+  .step-icon.done::before {
+    content: "";
+    width: 8px;
+    height: 4px;
+    border-left: 1.5px solid var(--ok);
+    border-bottom: 1.5px solid var(--ok);
+    transform: rotate(-45deg) translateY(-1px);
+  }
+  .think-block, .step-row {
+    border: none;
+    background: transparent;
+  }
+  .think-block > summary, .step-row > summary {
+    list-style: none;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 2px;
+    user-select: none;
+  }
+  .think-block > summary::-webkit-details-marker,
+  .step-row > summary::-webkit-details-marker { display: none; }
+  .think-block > summary::after, .step-row > summary::after {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-right: 1.5px solid var(--text-dim);
+    border-bottom: 1.5px solid var(--text-dim);
+    transform: rotate(-45deg);
+    margin-left: 4px;
+    opacity: .7;
+  }
+  .think-block[open] > summary::after, .step-row[open] > summary::after {
+    transform: rotate(45deg);
+  }
+  .think-title, .step-label { color: var(--text-dim); }
+  .think-block.done .think-title, .step-row.done .step-label { color: #9fb3c2; }
+  .think-body, .step-detail {
+    margin: 0 0 6px 22px;
+    padding: 8px 10px;
+    border-left: 1px solid #2a3b48;
+    font-size: 12px;
+    line-height: 1.55;
+    color: #8aa0b0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 240px;
+    overflow: auto;
+  }
+  .step-detail { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .msg.assistant .bubble.is-empty { display: none; }
   .approval-card {
     margin-top: 8px;
     padding: 12px 14px;
@@ -206,10 +305,16 @@
     border-radius: 6px;
     padding: 8px;
     font-size: 12px;
-    overflow-x: auto;
+    overflow: auto;
+    max-height: 280px;
     margin: 6px 0 10px;
     white-space: pre-wrap;
     word-break: break-word;
+  }
+  .approval-card .approval-path {
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-bottom: 6px;
   }
   .approval-actions { display: flex; gap: 8px; }
   .btn.approve { background: linear-gradient(135deg, #1f8f84, #2bb3a5); border: none; color: #061216; font-weight: 600; }
@@ -390,7 +495,7 @@
     </div>
     <label class="toggle">
       <input type="checkbox" id="showTools" checked>
-      显示工具调用
+      显示思考与工具
     </label>
   </header>
 
@@ -467,8 +572,8 @@ el.userIdInput.addEventListener('change', () => {
 el.showTools.addEventListener('change', () => {
   state.showTools = el.showTools.checked;
   localStorage.setItem('pa_showTools', state.showTools);
-  document.querySelectorAll('.tool-block,.agent-block,.plan-block').forEach(n => {
-    n.style.display = state.showTools ? 'block' : 'none';
+  document.querySelectorAll('.tool-block,.agent-block,.plan-block,.step-row,.think-block').forEach(n => {
+    n.style.display = state.showTools ? '' : 'none';
   });
 });
 
@@ -522,12 +627,215 @@ function appendBubble(role, content) {
   ensureEmptyHidden();
   const wrap = document.createElement('div');
   wrap.className = 'msg ' + role;
+  const body = role === 'assistant' ? mdLite(content) : escapeHtml(content);
   wrap.innerHTML = `<div class="role">${role === 'user' ? '你' : '助手'}</div>
-    <div class="bubble">${role === 'assistant' ? mdLite(content) : escapeHtml(content)}</div>
+    <div class="activity"></div>
+    <div class="bubble">${body}</div>
     <div class="extras"></div>`;
+  const bubble = wrap.querySelector('.bubble');
+  if (role === 'assistant') {
+    bubble.dataset.raw = content || '';
+    if (!content) bubble.classList.add('is-empty');
+  }
   el.messages.appendChild(wrap);
   el.messages.scrollTop = el.messages.scrollHeight;
   return wrap;
+}
+
+function appendAssistantShell() {
+  const wrap = appendBubble('assistant', '');
+  showStatus(wrap, '思考中');
+  return wrap;
+}
+
+function activityOf(wrap) {
+  let act = wrap.querySelector('.activity');
+  if (!act) {
+    act = document.createElement('div');
+    act.className = 'activity';
+    const bubble = wrap.querySelector('.bubble');
+    wrap.insertBefore(act, bubble || wrap.querySelector('.extras'));
+  }
+  return act;
+}
+
+function showStatus(wrap, label) {
+  const act = activityOf(wrap);
+  let row = act.querySelector('.status-row');
+  if (!row) {
+    row = document.createElement('div');
+    row.className = 'status-row';
+    act.insertBefore(row, act.firstChild);
+  }
+  row.innerHTML = `<span class="spinner"></span><span class="status-label live">${escapeHtml(label)}</span>`;
+}
+
+function hideStatus(wrap) {
+  const row = wrap.querySelector('.status-row');
+  if (row) row.remove();
+}
+
+function parseJson(data, fallback) {
+  if (data && typeof data === 'object') return data;
+  try { return JSON.parse(data); } catch (e) { return fallback || {}; }
+}
+
+const TOOL_LABELS = {
+  webSearchPrime: '联网搜索',
+  webReader: '阅读网页',
+  web_search: '联网搜索',
+  web_fetch: '读取网页',
+  calculate: '计算',
+  getCurrentDateTime: '查询时间',
+  todo_write: '更新计划',
+  agent_spawn: '委派子任务',
+  agent_send: '联系子任务',
+  read_file: '读取文件',
+  write_file: '写入文件',
+  edit_file: '编辑文件',
+  list_files: '列出文件',
+  memory_search: '检索记忆',
+  memory_get: '读取记忆',
+  memory_save: '保存记忆',
+  session_search: '检索会话日志',
+  search_conversation_history: '检索对话',
+  get_user_usage: '查看使用概况',
+  skill_manage: '管理技能',
+};
+
+function toolLabel(name) {
+  if (!name) return '调用工具';
+  return TOOL_LABELS[name] || ('调用 ' + name);
+}
+
+function ensureThink(wrap, startNew) {
+  const act = activityOf(wrap);
+  let block = act.querySelector('.think-block.live');
+  if (!block || startNew) {
+    if (block) finishThink(block);
+    hideStatus(wrap);
+    block = document.createElement('details');
+    block.className = 'think-block live';
+    block.open = true;
+    block.innerHTML = `<summary>
+        <span class="step-icon"><span class="spinner"></span></span>
+        <span class="think-title live">思考中</span>
+      </summary>
+      <div class="think-body"></div>`;
+    if (!state.showTools) block.style.display = 'none';
+    act.appendChild(block);
+  }
+  return block;
+}
+
+function appendThinkDelta(wrap, text) {
+  if (!text) return;
+  const block = ensureThink(wrap, false);
+  const body = block.querySelector('.think-body');
+  body.textContent = (body.textContent || '') + text;
+  el.messages.scrollTop = el.messages.scrollHeight;
+}
+
+function finishThink(block) {
+  if (!block) return;
+  block.classList.remove('live');
+  block.classList.add('done');
+  const title = block.querySelector('.think-title');
+  if (title) {
+    title.classList.remove('live');
+    title.textContent = block.querySelector('.think-body')?.textContent?.trim()
+      ? '已思考' : '已思考';
+  }
+  const icon = block.querySelector('.step-icon');
+  if (icon) icon.innerHTML = '';
+  icon && icon.classList.add('done');
+  const body = block.querySelector('.think-body');
+  if (!body || !body.textContent.trim()) {
+    if (body) body.remove();
+    block.open = false;
+  } else {
+    block.open = false;
+  }
+}
+
+function renderThinkDone(wrap, text) {
+  if (!text) return;
+  hideStatus(wrap);
+  const act = activityOf(wrap);
+  const block = document.createElement('details');
+  block.className = 'think-block done';
+  block.innerHTML = `<summary>
+      <span class="step-icon done"></span>
+      <span class="think-title">已思考</span>
+    </summary>
+    <div class="think-body">${escapeHtml(text)}</div>`;
+  if (!state.showTools) block.style.display = 'none';
+  act.appendChild(block);
+}
+
+function upsertStep(wrap, payload, kind) {
+  hideStatus(wrap);
+  const name = payload.tool || payload.name || payload.event || '工具';
+  const id = payload.id || name;
+  const key = (kind || 'tool') + ':' + id;
+  const act = activityOf(wrap);
+  let row = Array.from(act.querySelectorAll('.step-row')).find(n => n.dataset.step === key);
+  const running = payload.phase !== 'end' && payload.state !== 'ERROR';
+  if (!row) {
+    row = document.createElement('details');
+    row.className = 'step-row ' + (kind || 'tool');
+    row.dataset.step = key;
+    row.innerHTML = `<summary>
+        <span class="step-icon">${running ? '<span class="spinner"></span>' : ''}</span>
+        <span class="step-label"></span>
+      </summary>
+      <pre class="step-detail"></pre>`;
+    if (!state.showTools) row.style.display = 'none';
+    act.appendChild(row);
+  }
+  const label = row.querySelector('.step-label');
+  label.textContent = kind === 'agent'
+    ? ('子任务' + (payload.name ? ' · ' + payload.name : ''))
+    : (kind === 'plan' ? '更新计划' : toolLabel(name));
+  const icon = row.querySelector('.step-icon');
+  const done = payload.phase === 'end' || payload.state === 'ERROR' || payload.state === 'DENIED';
+  if (done) {
+    row.classList.add('done');
+    row.classList.remove('live');
+    icon.classList.add('done');
+    icon.innerHTML = '';
+    if (payload.state === 'ERROR' || payload.state === 'DENIED') {
+      label.textContent += payload.state === 'DENIED' ? '（已拒绝）' : '（失败）';
+    }
+  } else {
+    row.classList.add('live');
+    if (!icon.querySelector('.spinner')) icon.innerHTML = '<span class="spinner"></span>';
+  }
+  const detail = row.querySelector('.step-detail');
+  const extra = payload.args || payload.data || payload.event;
+  if (extra && typeof extra === 'object') {
+    detail.textContent = JSON.stringify(extra, null, 2);
+  } else if (typeof extra === 'string' && extra && extra.charAt(0) === '{') {
+    try { detail.textContent = JSON.stringify(JSON.parse(extra), null, 2); }
+    catch (e) { detail.textContent = extra; }
+  } else if (payload.tool || payload.name) {
+    detail.textContent = payload.tool || payload.name;
+  }
+  el.messages.scrollTop = el.messages.scrollHeight;
+}
+
+function finishActivity(wrap) {
+  hideStatus(wrap);
+  wrap.querySelectorAll('.think-block.live').forEach(finishThink);
+  wrap.querySelectorAll('.step-row.live').forEach(row => {
+    row.classList.remove('live');
+    row.classList.add('done');
+    const icon = row.querySelector('.step-icon');
+    if (icon) {
+      icon.classList.add('done');
+      icon.innerHTML = '';
+    }
+  });
 }
 
 function appendMeta(wrap, cls, text) {
@@ -673,22 +981,7 @@ async function openSession(id) {
     if (m.role === 'user' || m.role === 'assistant') {
       const wrap = appendBubble(m.role, m.content || '');
       const isLast = idx === messages.length - 1;
-      (m.events || []).forEach(ev => {
-        if (ev.type === 'plan') appendMeta(wrap, 'plan-block', '计划\n' + (ev.todos || ''));
-        if (ev.type === 'tool' || ev.type === 'tool_start' || ev.type === 'tool_end') {
-          appendMeta(wrap, 'tool-block', '工具\n' + JSON.stringify(ev));
-        }
-        if (ev.type === 'agent' || ev.type === 'agent_start' || ev.type === 'agent_end') {
-          appendMeta(wrap, 'agent-block', '子Agent\n' + JSON.stringify(ev));
-        }
-        if (ev.type === 'interrupt') {
-          if (isLast && detail.pendingApproval) {
-            appendApprovalCard(wrap, ev);
-          } else if (state.showTools) {
-            appendMeta(wrap, 'plan-block', '⏸ 审批记录\n' + JSON.stringify(ev));
-          }
-        }
-      });
+      (m.events || []).forEach(ev => replayEvent(wrap, ev, isLast && detail.pendingApproval));
     }
   });
   loadSessions();
@@ -763,14 +1056,14 @@ async function send() {
   state.streaming = true;
   el.input.value = '';
   appendBubble('user', text);
-  const aiWrap = appendBubble('assistant', '思考中…');
+  const aiWrap = appendAssistantShell();
   const bubble = aiWrap.querySelector('.bubble');
-  bubble.textContent = '';
 
   const abort = new AbortController();
   state.abort = abort;
 
   try {
+    // 真流式：后端直接订阅 Harness Flux，token 随到随推，不必等整段结束
     const res = await fetch('/api/assistant/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -778,13 +1071,18 @@ async function send() {
       signal: abort.signal
     });
     if (!res.ok) {
+      bubble.classList.remove('is-empty');
       bubble.textContent = '请求失败 HTTP ' + res.status;
+      hideStatus(aiWrap);
       return;
     }
     await consumeSse(res, (event, data) => handleSse(event, data, aiWrap, bubble));
+    finishActivity(aiWrap);
   } catch (e) {
     if (e.name !== 'AbortError') {
+      bubble.classList.remove('is-empty');
       bubble.textContent = '请求失败: ' + e.message;
+      hideStatus(aiWrap);
     }
   } finally {
     if (state.abort === abort) state.abort = null;
@@ -804,9 +1102,13 @@ async function resumeApproval(card, approved) {
 
   const aiWrap = card.closest('.msg');
   const bubble = aiWrap.querySelector('.bubble');
+  showStatus(aiWrap, approved ? '继续执行' : '调整方案');
   const resultLine = document.createElement('div');
   resultLine.className = 'approval-result';
-  resultLine.textContent = approved ? '✅ 已批准，继续执行…' : '🚫 已拒绝，让模型调整方案…';
+  const summary = card.dataset.summary || '未知工具';
+  resultLine.textContent = approved
+    ? '✅ 已批准 ' + summary + '，继续执行…'
+    : '🚫 已拒绝 ' + summary + '，让模型调整方案…';
   card.appendChild(resultLine);
   card.classList.add('resolved');
 
@@ -821,12 +1123,25 @@ async function resumeApproval(card, approved) {
     });
     if (!res.ok) {
       resultLine.textContent += '（续跑请求失败 HTTP ' + res.status + '）';
+      hideStatus(aiWrap);
+      state.pendingApproval = true;
+      card.classList.remove('resolved');
+      card.querySelectorAll('button').forEach(b => b.disabled = false);
+      el.btnSend.disabled = true;
+      el.btnSend.title = '有待审批的操作，请先批准或拒绝';
       return;
     }
     await consumeSse(res, (event, data) => handleSse(event, data, aiWrap, bubble));
+    finishActivity(aiWrap);
   } catch (e) {
     if (e.name !== 'AbortError') {
       resultLine.textContent += '（续跑失败: ' + e.message + '）';
+    
+      state.pendingApproval = true;
+      card.classList.remove('resolved');
+      card.querySelectorAll('button').forEach(b => b.disabled = false);
+      el.btnSend.disabled = true;
+      el.btnSend.title = '有待审批的操作，请先批准或拒绝';
     }
   } finally {
     if (state.abort === abort) state.abort = null;
@@ -841,9 +1156,15 @@ function appendApprovalCard(aiWrap, payload) {
   const card = document.createElement('div');
   card.className = 'approval-card';
   const tool = payload.tool || '未知工具';
-  const args = payload.args ? JSON.stringify(payload.args, null, 2) : '';
-  card.innerHTML = `<div class="approval-title">⏸ 等待人工审批：${escapeHtml(tool)}</div>
-    ${args ? `<pre>${escapeHtml(args)}</pre>` : ''}
+  const summary = payload.summary || tool;
+  const path = payload.path || '';
+  const preview = payload.preview || '';
+  const args = !preview && payload.args ? JSON.stringify(payload.args, null, 2) : '';
+  const body = preview || args;
+  card.dataset.summary = summary;
+  card.innerHTML = `<div class="approval-title">⏸ 等待人工审批：${escapeHtml(summary)}</div>
+    ${path ? `<div class="approval-path">路径：${escapeHtml(path)}</div>` : ''}
+    ${body ? `<pre>${escapeHtml(body)}</pre>` : ''}
     <div class="approval-actions">
       <button class="btn approve">批准执行</button>
       <button class="btn reject">拒绝</button>
@@ -857,27 +1178,76 @@ function appendApprovalCard(aiWrap, payload) {
   el.btnSend.title = '有待审批的操作，请先在上方批准或拒绝';
 }
 
+function replayEvent(wrap, ev, pendingInterrupt) {
+  const type = ev.type;
+  if (type === 'thinking') {
+    renderThinkDone(wrap, ev.text || '');
+    return;
+  }
+  const payload = Object.assign({}, ev, parseJson(ev.data, {}));
+  if (type === 'plan' || type === 'tool' || type === 'tool_start' || type === 'tool_end') {
+    payload.phase = payload.phase || 'end';
+    upsertStep(wrap, payload, type === 'plan' ? 'plan' : 'tool');
+    return;
+  }
+  if (type === 'agent' || type === 'agent_start' || type === 'agent_end') {
+    payload.phase = payload.phase || 'end';
+    upsertStep(wrap, payload, 'agent');
+    return;
+  }
+  if (type === 'interrupt') {
+    if (pendingInterrupt) {
+      appendApprovalCard(wrap, payload);
+    } else if (state.showTools) {
+      upsertStep(wrap, Object.assign({phase: 'end', state: 'DONE', summary: (payload.summary || payload.tool || '工具') + '（已处理）'}, payload), 'tool');
+    }
+  }
+}
+
 function handleSse(event, data, aiWrap, bubble) {
   if (event === 'session') {
     state.sessionId = data;
     localStorage.setItem('pa_sessionId', data);
     el.currentSession.textContent = data;
+  } else if (event === 'status') {
+    const payload = parseJson(data, {});
+    if (!aiWrap.querySelector('.think-block.live') && !aiWrap.querySelector('.step-row.live')) {
+      showStatus(aiWrap, payload.label === 'thinking' ? '思考中' : (payload.label || '处理中'));
+    }
+  } else if (event === 'thinking') {
+    const payload = parseJson(data, {});
+    if (payload.phase === 'start') {
+      ensureThink(aiWrap, true);
+    } else if (payload.phase === 'delta') {
+      appendThinkDelta(aiWrap, payload.text || '');
+    } else if (payload.phase === 'end') {
+      const live = aiWrap.querySelector('.think-block.live');
+      if (live) finishThink(live);
+    }
   } else if (event === 'token') {
+    hideStatus(aiWrap);
+    const live = aiWrap.querySelector('.think-block.live');
+    if (live) finishThink(live);
+    bubble.classList.remove('is-empty');
     bubble.innerHTML = mdLite((bubble.dataset.raw || '') + data);
     bubble.dataset.raw = (bubble.dataset.raw || '') + data;
     el.messages.scrollTop = el.messages.scrollHeight;
   } else if (event === 'plan') {
-    appendMeta(aiWrap, 'plan-block', '计划\n' + data);
+    upsertStep(aiWrap, parseJson(data, {tool: 'todo_write', phase: 'start'}), 'plan');
   } else if (event === 'tool') {
-    appendMeta(aiWrap, 'tool-block', '工具\n' + data);
+    upsertStep(aiWrap, parseJson(data, {phase: 'start'}), 'tool');
   } else if (event === 'agent') {
-    appendMeta(aiWrap, 'agent-block', '子Agent\n' + data);
+    upsertStep(aiWrap, parseJson(data, {phase: 'start'}), 'agent');
   } else if (event === 'interrupt') {
-    let payload = {};
-    try { payload = JSON.parse(data); } catch (e) { /* 忽略解析失败，仍展示原文 */ }
-    appendApprovalCard(aiWrap, payload);
+    hideStatus(aiWrap);
+    finishActivity(aiWrap);
+    appendApprovalCard(aiWrap, parseJson(data, {}));
   } else if (event === 'error') {
+    hideStatus(aiWrap);
+    bubble.classList.remove('is-empty');
     bubble.textContent = (bubble.dataset.raw || '') + '\n[错误] ' + data;
+  } else if (event === 'done') {
+    finishActivity(aiWrap);
   }
 }
 

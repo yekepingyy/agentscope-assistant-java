@@ -1,8 +1,9 @@
 # 小深助手测试用例
 
-项目：`agentscope-assistant-java`  
-基线：已有 11 个自动化用例（记忆解析、会话关键词、MCP 0.17 schema、Redis 集成）。  
-应用默认：`http://localhost:8089`
+项目目录：`agentscope-assistant-java-2`（Maven artifact 可能仍是 `agentscope-assistant-java`）  
+基线：已有自动化用例（记忆解析、会话关键词、`tools.json` MCP 声明、Redis 工作区、MySQL AgentState）。  
+应用默认：`http://localhost:8089`  
+文档对齐：2026-09-15 — 子 Agent 官方扫 `workspace/subagents/*.md`；聊天 SSE 为 Flux + `RedisSessionRunLock`；`agent.max-iters=25`。
 
 | 状态 | 含义 |
 |------|------|
@@ -15,9 +16,9 @@
 - 单测：`mvn test`
 - HTTP：应用起来后用 curl
 - 对话 / 前端：浏览器打开首页，侧栏填用户
-- 应用启动前必须有 Redis（默认 `127.0.0.1:6379`）；不再有单机 JSON 模式 / `distributed` profile
+- 应用启动前必须有 **MySQL**（库 `agentscope_assistant`，utf8mb4）和 **Redis**（默认 `127.0.0.1:6379`）；不再有单机 JSON 模式 / `distributed` profile
 
-Redis 集成测试只 FLUSHDB **db=15**，不会清应用默认的 db=0。对话类依赖百炼额度，没钱时先看 C-14。
+Redis 集成测试只 FLUSHDB **db=15**，不会清应用默认的 db=0。MySQL 测例只用 **`agentscope_assistant_test`**。对话类依赖百炼额度，没钱时先看 C-14。
 
 ---
 
@@ -36,7 +37,12 @@ Redis 集成测试只 FLUSHDB **db=15**，不会清应用默认的 db=0。对话
 | U-09 | 待补 | 删除会话只删自己的 | alice 删 `sess1`；bob 同 id 的会话仍在 | alice 列表空，bob 不受影响；pending approval key 一并清 |
 | U-10 | 已覆盖 | 历史关键词计数与摘要 | `SessionStoreSearchTest` | 重叠命中计数正确；snippet 含关键词 |
 | U-11 | 已覆盖 | MEMORY.md 事实解析 | `HarnessMemoryCatalogTest` | 标题映射 preference / project；占位行忽略 |
-| U-12 | 已覆盖 | MCP 0.17 schema / 结果文本 | `McpToolSupportTest` | 按 inputSchema 选参；TextContent 优先，否则 structuredContent |
+| U-12 | 已覆盖 | 官方 tools.json MCP | `ToolsJsonTest` | 工作区根 `tools.json`：mcpServers 为 zhipu-web-search / zhipu-web-reader；Java MCP SDK 用智谱文档的 SSE 回退（`/sse?Authorization=`）；deny 含 web_search；可反序列化为官方 `ToolsConfig` |
+| U-13 | 已覆盖 | MDC 写入 SESSION_ID | `ConversationMdcTest` | `open` 后 `%X{SESSION_ID}` 能读到；`run` 抛异常也 clear |
+| U-14 | 已覆盖 | 路径解析 sessionId | `SessionMdcInterceptorTest` | `/api/sessions/{id}` 抽出 id；列表 / 聊天路径为 null |
+| U-15 | 待补 | ProcessEnv 写入 getenv | `ProcessEnv.ensure("MCP_API_KEY", v)` | 已有非空 env 不覆盖；空 value 返回 false；写入后 `System.getenv` 非空 |
+| U-16 | 已覆盖 | 思考 / 工具事件映射 | `AgentEventMapperTest` | `ModelCallStart` → live `status`；thinking delta 不落库、end 可持久化；工具 start 带 name/id；todo → plan |
+| U-17 | 已覆盖 | 活动日志截断与检索词 | `AgentActivityLoggerTest` | clip 超长加字数；args 里的 api-key 打码；webSearchPrime / webReader 抽出 query/url |
 
 ---
 
@@ -46,8 +52,8 @@ Redis 集成测试只 FLUSHDB **db=15**，不会清应用默认的 db=0。对话
 
 | ID | 状态 | 场景 | 步骤 | 期望 |
 |----|------|------|------|------|
-| A-01 | 待补 | 健康检查 | `GET /api/health` | `status=ok`，`storage=redis`，`multi_replica=true`，`multi_user=true`，`mcp_enabled` 与配置一致 |
-| A-02 | 待补 | Agent 能力清单 | `GET /api/agents` | 含 `research-agent`、`memory_search`、`todo_write` 等 |
+| A-01 | 待补 | 健康检查 | `GET /api/health` | `status=ok`，`storage=mysql+redis`，`multi_replica=true`，`multi_user=true`，`mcp=tools.json`；`mcp_enabled=true` 且 `mcp_tools` 含 `webSearchPrime` / `webReader`（Toolkit 真实 MCP 工具，不是仅密钥已配） |
+| A-02 | 待补 | Agent 能力清单 | `GET /api/agents` | 含 `research-agent`；`harness` 为当前 Toolkit 实名，应含 `webSearchPrime` / `webReader` / `todo_write` |
 | A-03 | 待补 | 建会话：header / query / 默认用户 | `POST /api/sessions`；分别带 `X-User-Id`、`?userId=`、都不带 | 返回新对话；不带时落到 user=`local` |
 | A-04 | 待补 | 列会话只返回本用户 | alice、bob 各 POST 会话后 `GET /api/sessions?userId=alice` | 只有 alice 的会话 |
 | A-05 | 待补 | 取不存在会话 | `GET /api/sessions/not-exist?userId=alice` | HTTP 400，error 含「会话不存在」 |
@@ -59,6 +65,8 @@ Redis 集成测试只 FLUSHDB **db=15**，不会清应用默认的 db=0。对话
 | A-11 | 待补 | 聊天非法 userId | `POST chat {userId:"../x", message:"hi"}` | SSE error 非法 userId，不落盘 |
 | A-12 | 待补 | 续跑无待审批 | `POST /api/assistant/resume` 且无 pending | SSE error「当前会话没有待审批的操作」 |
 | A-13 | 待补 | 聊天首包带 session | `POST chat` 不传 sessionId（可用 mock 模型） | 先 `session` 事件给出新 id，结束有 `done`；会话 JSON 写入对应用户目录 |
+| A-14 | 待补 | 同会话互斥 | 同一 session 连续两次 chat（第二轮在第一轮结束前） | 第二轮 SSE error「该会话正在处理中」 |
+| A-15 | 待补 | 有 pending 时禁止新聊 | 会话卡在写文件审批后再 chat | SSE error「当前会话有待审批的操作」 |
 
 ### curl 示例
 
@@ -85,12 +93,12 @@ bob 的列表不应出现 alice 刚建的会话。
 
 | ID | 状态 | 场景 | 步骤 | 期望 |
 |----|------|------|------|------|
-| C-01 | 手工 | 普通问答 | 对 alice 说：「用一句话介绍你自己」 | 流式 token；侧栏出现会话；刷新后记录还在 |
+| C-01 | 手工 | 普通问答（真流式） | 对 alice 说一句较长的自我介绍请求 | token 逐字出现，不必等整段结束；侧栏出现会话；刷新后记录还在 |
 | C-02 | 手工 | 调用计算器 | 「算一下 (18+7)*3 等于多少，必须用工具」 | 工具条出现 `calculate`；答案 75 |
 | C-03 | 手工 | 当前时间 | 「现在几点了，星期几」 | 调用 `getCurrentDateTime`；日期接近本机时间 |
-| C-04 | 手工 | 联网搜索（MCP 开） | 确认 `health.mcp_enabled=true`；「搜一下今天杭州天气」 | 调用 `webSearch`；日志 `[MCP] search END`；结果有来源/摘要 |
-| C-05 | 手工 | 读网页（MCP） | 给一个公开 URL：「打开这个链接总结要点」 | 调用 `webRead`；有正文摘要。MCP 挂了要提示未连上 reader |
-| C-06 | 手工 | REST 回退搜索 | `mcp.zhipu.enabled=false` 重启后再搜 | `mcp_enabled=false`；日志 `[REST] search`；`webRead` 提示 REST 模式 |
+| C-04 | 手工 | 联网搜索（MCP） | 确认 `health.mcp=tools.json`；「搜一下今天杭州天气」 | 调用 `webSearchPrime`；结果有来源/摘要 |
+| C-05 | 手工 | 读网页（MCP） | 给一个公开 URL：「打开这个链接总结要点」 | 调用 `webReader`；有正文摘要。MCP 挂了工具未注册或返回错误 |
+| C-06 | 手工 | MCP 未配置 | 不设 `MCP_API_KEY` / `mcp.api-key` 且 LLM key 也无法用于智谱，重启后再搜 | 启动日志 warn 注册失败；不能再靠 REST 回退 |
 | C-07 | 手工 | 写文件触发人工审批 | 「在工作区写一个 hello.txt，内容是 ping」 | SSE 出审批卡（`write_file` / `edit_file`）；暂停，文件未落盘 |
 | C-08 | 手工 | 批准后续跑 | 在 C-07 卡片点批准 | POST resume `approved=true`；文件出现在该用户工作区；会话继续 |
 | C-09 | 手工 | 拒绝写文件 | 再要求写文件后点拒绝 | 不写文件；模型说明被拒绝；pending 清除 |
@@ -121,17 +129,18 @@ bob 的列表不应出现 alice 刚建的会话。
 | F-03 | 手工 | 删除会话按钮 | 侧栏点删除 | 调用 DELETE 带 userId；条目消失；当前窗清空 |
 | F-04 | 手工 | 审批卡按钮 | 触发写文件后点批准/拒绝 | 卡片 resolved；resume 带同一 userId / sessionId |
 | F-05 | 手工 | 档案与检索面板 | 打开记忆/历史检索，输入关键词 | 请求带 userId；结果只属当前用户 |
+| F-06 | 手工 | 思考与工具活动流 | 发一句闲聊，再强制调用计算/搜索 | 发送后立刻出现「思考中」动效；有工具时出现可折叠步骤（搜索/计算），完成后打勾；最终答案在下方气泡。刷新后思考原文与工具步骤仍在 |
 
 ---
 
-## 5. Redis 多副本
+## 5. Redis / MySQL 多副本
 
 | ID | 状态 | 场景 | 步骤 | 期望 |
 |----|------|------|------|------|
-| D-01 | 已覆盖 | Redis 状态读写隔离 | `RedisStoresIntegrationTest`（需本机 6379） | alice/sess1 与 bob 隔离；delete / list 正确 |
-| D-02 | 已覆盖 | Redis 工作区 CAS | 同测试类 BaseStore `put` / `putIfVersion` | 版本冲突失败；search 分页 |
-| D-03 | 手工 | 默认启动即 Redis | 不设 profile；`GET /api/health` | `storage=redis`；聊天后 Redis 出现 `as:state:` / `as:base:` / `as:web:` 键 |
-| D-04 | 手工 | 两副本共享会话 | 两进程不同 `server.port`，同一 Redis；A 聊完 B 用同 userId+sessionId 续 | B 能读到 AgentState / 工作区 |
+| D-01 | 已覆盖 | MySQL AgentState 读写隔离 | `MysqlAgentStateStoreTest`（需本机 3306） | alice/sess1 与 bob 隔离；delete / list 正确 |
+| D-02 | 已覆盖 | Redis 工作区 CAS | `RedisStoresIntegrationTest` BaseStore `put` / `putIfVersion` | 版本冲突失败；search 分页 |
+| D-03 | 手工 | 默认启动 MySQL+Redis | 不设 profile；`GET /api/health` | `storage=mysql+redis`；聊天后 MySQL `agentscope_sessions` 有行，Redis 出现 `as:base:` / `as:web:` 键 |
+| D-04 | 手工 | 两副本共享会话 | 两进程不同 `server.port`，同一 MySQL+Redis；A 聊完 B 用同 userId+sessionId 续 | B 能读到 AgentState / 工作区 |
 
 ---
 

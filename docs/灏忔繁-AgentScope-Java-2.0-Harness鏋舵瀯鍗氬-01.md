@@ -1,10 +1,29 @@
 # 小深：用 AgentScope Java 2.0 Harness 做私人助手（上）
 
-> 本篇是系列 **上篇**：为什么用官方 Harness、六层架构、装配层、Redis、记忆与多用户隔离。  
-> 下篇：[小深-AgentScope-Java-2.0-Harness架构博客-02.md](./小深-AgentScope-Java-2.0-Harness架构博客-02.md)（工具、MCP/REST、SSE、前端、踩坑笔记）  
-> 项目：`agentscope-assistant-java` · 技术栈：**Spring Boot 3.2.5 + AgentScope Java 2.0.1 `HarnessAgent` + MCP SDK 0.17.0**
->
-> **相对早期草稿的变更（请以本节为准）：** 已去掉单机 JSON / `distributed` profile；生产只连 Redis。网页会话、AgentState、工作区文件、写文件审批都在 Redis。自定义深色 UI（不用官方 AG-UI）。日志 `%X{SESSION_ID}` 不打印 userId。集成测试只 FLUSHDB **db=15**。
+> 本篇是系列 **上篇**：为什么用官方 Harness、六层架构、存储最佳实践（MySQL AgentState + Redis 工作区）、装配层、记忆与多用户隔离。  
+> 下篇：[小深-AgentScope-Java-2.0-Harness架构博客-02.md](./小深-AgentScope-Java-2.0-Harness架构博客-02.md)（工具、官方 tools.json MCP、SSE、子 Agent、踩坑笔记）  
+> 项目目录：`agentscope-assistant-java-2` · 技术栈：**Spring Boot 3.2.5 + AgentScope Java 2.0.1 `HarnessAgent` + MCP SDK 0.17.0**  
+> 装配入口：`cn.deepassistant.config.AgentScopeConfig` · 端口默认 **8089**
+
+## 与仓库对齐（2026-09-15）
+
+学习时请 **以仓库源码为准**；下文若仍夹有早期整文件粘贴，把它当成「读过一遍的注释」，不要当可复制的当前实现。
+
+| 主题 | 当前做法 |
+|------|----------|
+| 子 Agent | **官方自动加载** `workspace/subagents/*.md`，Java **不要**再 `.subagents(...)` |
+| research-agent | `workspace/subagents/research-agent.md`：`isolated` + `maxIters: 25` + ephemeral（不写 MEMORY） |
+| MCP | `workspace/tools.json`；`build()` 前 `McpServerRegistrar.register`，isolated 子 Agent 才能继承工具 |
+| 只读 MCP | `agent.auto-allow-tools=webReader,webSearchPrime`，强制 `readOnly`，避免 ASK |
+| 记忆 | `.memory(MemoryConfig)` Flush → `memory/YYYY-MM-DD.md`，Consolidation → `MEMORY.md`（Redis 工作区） |
+| 对话 SSE | `AssistantChatService` 订阅 `HarnessAgent.streamEvents` 的 **Flux**，禁止 `toIterable()` |
+| 同会话互斥 | `RedisSessionRunLock` |
+| 审批续跑 | `RedisPendingApprovalStore.claim` 后再 resume |
+| 迭代上限 | `application.yml` → `agent.max-iters: 25`（不是 80） |
+| 模型示例 | `llm.model: qwen3.8-max` |
+| 存储 | AgentState → MySQL；工作区 / 网页会话 / pending / run-lock → Redis。不要 `MysqlDistributedStore.create()` |
+
+对照阅读：[README](../README.md) · [下篇](./小深-AgentScope-Java-2.0-Harness架构博客-02.md) · [测试用例](./test-cases.md)
 
 ## 0. 写在前面
 
@@ -22,14 +41,14 @@
 |------|------|----------------|
 | 规划（todos / Plan Mode） | 多步任务显式化；复杂事先写方案 | `TodoTools` + `enablePlanMode()` |
 | 文件系统（带隔离） | 中间产物进 Redis 工作区；按用户分命名空间 | `RemoteFilesystemSpec.isolationScope(USER)` |
-| 子 Agent | 专科活隔离上下文 | 不 disable；`workspace/subagents/` + `agent_spawn` |
+| 子 Agent | 专科活隔离上下文 | 不 disable；官方扫 `workspace/subagents/*.md` + `agent_spawn` |
 | 人工审批（HITL） | 写文件中断，等人批准后再续跑 | `PermissionBehavior.ASK` + Redis `as:pending:` + `/api/assistant/resume` |
 | 分层记忆 | 日流水 Flush + 长期 Consolidation | `.memory(MemoryConfig)`，不要自己抽 JSON |
 | 上下文压缩 | 超长摘要前缀，原文卸到 jsonl | `.compaction(...)` + `session_search` |
 | 技能 | 目录渐进加载；可自进化 | `enableSkillManageTool` + `enableSkillCurator` |
-| 会话恢复 | 任意副本用 (userId, sessionId) 续跑 | 唯一后端：`RedisAgentStateStore` |
+| 会话恢复 | 任意副本用 (userId, sessionId) 续跑 | 官方 `MysqlAgentStateStore` |
 | 多用户 | 记忆 / 工作区 / 网页会话互不可见 | `RuntimeContext.userId` + `IsolationScope.USER` |
-| 多副本 | 状态、工作区、网页会话、审批单共享 | 默认 Redis，**没有** `distributed` profile |
+| 多副本 | 状态、工作区、网页会话、审批单共享 | AgentState 走 MySQL，其余 Redis；**没有** `distributed` profile |
 
 本项目是这套思想的 **Spring 接线示例**：统筹助手「小深」+ 联网调研工具 + 官方 research/general-purpose 子 Agent，前端通过 SSE 看工具轨迹并处理审批卡片。
 
@@ -46,31 +65,35 @@
 │  L6  产品层                                                      │
 │      AssistantController（SSE /chat + /resume，全部带 userId）     │
 │      AssistantChatService（RuntimeContext + Redis pending）        │
-│      AgentEventMapper（官方 AgentEvent → token/tool/interrupt）    │
+│      AgentEventMapper（token / thinking / status / tool / interrupt）│
+│      AgentActivityLogger（后台打工具参数、搜索词、思考与作答）        │
 │      SessionStore（网页聊天 JSON，Redis as:web: / as:web-index:）   │
 ├─────────────────────────────────────────────────────────────────┤
-│  L5  生产存储（只有 Redis，无单机 JSON）                           │
-│      RedisAgentStateStore + RedisBaseStore + RedisPendingApproval  │
+│  L5  生产存储（混搭：MySQL AgentState + Redis 工作区，无单机 JSON） │
+│      官方 MysqlAgentStateStore + RedisBaseStore + RedisPending     │
 │      RemoteFilesystemSpec + DistributedStore                       │
 │      ConversationMdc / SessionMdcInterceptor（日志 SESSION_ID）    │
 ├─────────────────────────────────────────────────────────────────┤
 │  L4  统筹 HarnessAgent                                           │
 │      ModelRegistry.resolve("openai:"+model) 流式                  │
-│      maxIters=80 · PermissionMode.BYPASS + write_file ASK         │
+│      maxIters=25 · PermissionMode.BYPASS + write_file ASK         │
 │      MemoryConfig（Flush / Consolidation）                        │
 │      CompactionConfig + ToolResultEviction + Plan Mode + Skills    │
+│      stopOnReject / disableShellTool / enableAgentTracingLog=false │
 ├─────────────────────────────────────────────────────────────────┤
 │  L3  工具                                                         │
 │      官方：todo_write、filesystem、agent_spawn、memory_*、          │
 │            session_search、skill_manage                           │
-│      本项目：webSearch/webRead、calculate、getCurrentDateTime、     │
-│            search_conversation_history                            │
+│      本项目：calculate、getCurrentDateTime、search_conversation_history │
+│      智谱 MCP（tools.json）：webSearchPrime / webReader            │
+│      build() 前 McpServerRegistrar + auto-allow-tools 强制只读     │
 ├─────────────────────────────────────────────────────────────────┤
-│  L2  子 Agent（框架内置 + 工作区 agents/）                         │
-│      research-agent / general-purpose · 提示词在 workspace/        │
+│  L2  子 Agent（框架内置 general-purpose + 工作区 subagents/）      │
+│      research-agent.md · DynamicSubagents Layer2 自动加载          │
+│      isolated 工作区继承父 Toolkit 的 MCP，不写长期记忆            │
 ├─────────────────────────────────────────────────────────────────┤
 │  L1  外部世界                                                     │
-│      OpenAI 兼容大模型 · 智谱 MCP 0.17 · 必连 Redis（ping 失败不起）│
+│      OpenAI 兼容大模型 · 智谱 MCP 0.17 · 必连 MySQL + Redis        │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -83,16 +106,16 @@ sequenceDiagram
     participant S as AssistantChatService
     participant H as HarnessAgent
     participant F as MemoryFlushMiddleware
-    participant M as 智谱 MCP / REST
+    participant M as 智谱 MCP（tools.json）
 
     U->>C: POST /api/assistant/chat (SSE, userId)
     C->>S: chat(userId, sessionId, message)
     S->>S: SessionStore 落 user 消息
     S->>H: streamEvents(UserMessage, RuntimeContext)
     H->>H: 注入 MEMORY.md / AGENTS.md / 技能
-    alt 模型调 webSearch
-        H->>M: MCP tools/call 或 REST web_search
-        M-->>H: 检索结果
+    alt 模型调 webSearchPrime / webReader
+        H->>M: 官方 MCP tools/call（tools.json mcpServers）
+        M-->>H: 检索 / 网页正文
     end
     alt write_file 命中 ASK
         H-->>S: RequireUserConfirmEvent
@@ -101,8 +124,9 @@ sequenceDiagram
         C->>S: resume(approved)
         S->>H: ConfirmResult 续跑
     end
-    H-->>S: TextBlockDelta / ToolCallStart ...
-    S-->>U: SSE token / tool / plan / agent / done
+    H-->>S: Thinking / ToolCall / TextBlockDelta ...
+    S-->>S: AgentActivityLogger 打工具/搜索/思考日志（无 userId）
+    S-->>U: SSE status / thinking / token / tool / plan / agent / done
     S->>S: SessionStore 落 assistant
     Note over H,F: 流结束后后台 Flush → memory/YYYY-MM-DD.md
 ```
@@ -118,15 +142,15 @@ sequenceDiagram
 | 子 Agent | `agent_spawn` | 不 disable | `task` / `task_batch` |
 | HITL | Permission ASK | `approval-tools` + Redis pending | `approvalOn(...)` |
 | 压缩 | `CompactionConfig` | 显式打开 | `SummarizingConversationContextPolicy` |
-| 状态 | `AgentStateStore` | 仅 Redis | `FileSystemSaver` checkpoint |
-| 联网 | MCP Client | SDK **0.17.0** + REST 回退 | MCP 0.14.1 路径 |
+| 状态 | `AgentStateStore` | 官方 MySQL（工作区仍 Redis） | `FileSystemSaver` checkpoint |
+| 联网 | `workspace/tools.json` `mcpServers` | Harness 构建期注册 MCP；无 REST 回退 | MCP 0.14.1 路径 |
 
 ### 1.4 角色分工
 
 | 角色 | 职责 | 典型工具 |
 |------|------|----------|
 | **统筹（小深）** | 理解目标、规划、委派、对用户答复 | todos、files、agent_spawn、memory_*、时间/计算、网页检索 |
-| **research-agent** | 多角度联网调研 | 工作区 `subagents/research-agent.md`；主工具仍是 webSearch/webRead |
+| **research-agent** | 多角度联网调研 | 工作区 `subagents/research-agent.md`；工具 `webSearchPrime` / `webReader` |
 | **网页用户** | 看自己的会话和档案 | `/api/history/search`、`/api/memory`，与官方 jsonl 不是同一份 |
 
 两份「历史」不要混：
@@ -141,26 +165,55 @@ sequenceDiagram
 ### 1.5 关键运行配置
 
 - 端口：`8089`
-- 模型：OpenAI 兼容（`llm.*`，示例 `qwen3.8-27b` / 百炼 MaaS）
-- **思考模式**：`llm.enable-thinking: false`（Qwen 思考 + 流式时 tool_calls 容易不稳）
-- 联网：默认 MCP（`mcp.zhipu.enabled=true`），SDK **必须 0.17.0+** 才能和 agentscope 的 `json-schema-validator:2.0.0` 共存
-- 迭代：`agent.max-iters=80`
-- 审批：`write_file` / `edit_file`
-- 工作区种子：`workspace/`（`AGENTS.md`、skills、subagents）。运行时 MEMORY.md / 日流水 / jsonl 在 Redis
-- Redis：默认 `127.0.0.1:6379` db=0，**启动必 ping**；不需要 `distributed` profile
-- 日志：`logback.xml` 打印 `%X{SESSION_ID}`，**不打印 userId**（避免泄露用户信息）
+- 模型：OpenAI 兼容（`llm.*`，示例 `qwen3.8-max` / 百炼 MaaS）
+- **思考模式**：yml 当前 `llm.enable-thinking: true`，前端可折叠展示「已思考」。Qwen 开思考时流式 tool_call 可能不稳；若工具调不起来可改回 `false`。即使关掉，发送后仍会显示「思考中」（`ModelCallStart`）
+- 联网：官方 `workspace/tools.json` 的 `mcpServers`。智谱 `/mcp` 是 Streamable HTTP（只接受 POST）；本项目按文档给 Java SDK 配 SSE：`/sse?Authorization=${MCP_API_KEY}`。SDK **必须 0.17.0+**。密钥用智谱 API Key（不要用百炼 Key）：优先 `MCP_API_KEY`，否则 yml `mcp.api-key`
+- 迭代：`agent.max-iters=25`（yml；`AgentScopeConfig` 默认值已对齐）
+- 审批：`write_file` / `edit_file`；只读 MCP：`auto-allow-tools=webReader,webSearchPrime`
+- 工作区种子：`workspace/`（`AGENTS.md`、`tools.json`、skills、**subagents**）。IDEA Working directory 指错时 `WorkspaceRoots` 回退。运行时 MEMORY.md / 日流水 / jsonl 在 Redis
+- MySQL：默认库 `agentscope_assistant`（utf8mb4），**启动必连**；官方 store 可自动建表 `agentscope_sessions`
+- Redis：默认 `127.0.0.1:6379` db=0，**启动必 ping**；生产给工作区开 AOF/RDB。不需要 `distributed` profile
+- 日志：`logback.xml` 打印 `%X{SESSION_ID}`，**不打印 userId**。`AgentActivityLogger` 会打模型调用、思考摘要、工具参数、搜索词/结果、作答预览（过长截断，密钥打码）
 
-`${user.dir}` 是 **JVM 工作目录**（IDEA 跑该模块时一般是 `agentscope-assistant-java/`）：
+`${user.dir}` 是 **JVM 工作目录**（IDEA 跑该模块时一般是 `agentscope-assistant-java-2/`）：
 
 | 配置 / 存储 | 位置 | 用途 |
 |------|------|------|
-| `agent.workspace` | `workspace/` | 种子：AGENTS.md、skills、subagents、PREFERENCES.md |
-| Redis `as:state:` / `as:list:` | AgentState | 对话上下文、权限、计划；框架 `streamEvents` 自动 load/save |
+| `agent.workspace` | `workspace/` | 种子：AGENTS.md、tools.json、skills、subagents；IDEA cwd 不对时 `WorkspaceRoots` 回退到模块根 |
+| MySQL `agentscope_sessions` | AgentState | 官方 `MysqlAgentStateStore`；对话上下文、权限、计划；框架 `streamEvents` 自动 load/save |
 | Redis `as:base:` | RemoteFilesystem | MEMORY.md、日流水、压缩卸载 jsonl |
 | Redis `as:web:` / `as:web-index:` | 网页会话 | 侧栏列表与聊天全文 |
 | Redis `as:pending:` | HITL | 写文件审批单，TTL 1 小时 |
 
-### 1.6 多用户与 HITL（必读）
+### 1.6 存储怎么分（最佳实践）
+
+官方文档里 Redis 是多副本默认；MySQL 适合「状态要进关系库、要备份」。`DistributedStore` **允许混搭**：`agentStateStore` 和 `baseStore` 可以不是同一个后端。本项目按「稳 / 热 / 短命」切开，这就是推荐用法。
+
+| 数据 | 放哪 | 实现 | 为什么 |
+|------|------|------|--------|
+| 对话状态（messages、权限、计划） | **MySQL** | 官方 `MysqlAgentStateStore` | 每轮 load/save；要扛 Redis 重启 / `FLUSHDB`；备份、按用户查都方便 |
+| 工作区（MEMORY.md、日流水、jsonl） | **Redis** | 本项目 `RedisBaseStore` | 每轮开头都读 MEMORY.md，要低延迟；写文件靠 Hash + Lua 做版本 CAS |
+| 网页侧栏会话 | **Redis** | `SessionStore` | 列表 / 检索很勤，JSON 小对象 |
+| 写文件审批 | **Redis + TTL** | `RedisPendingApprovalStore` | 批准可能打到另一台副本；1 小时无人点就该消失。MySQL 没有同等便宜的过期 |
+| Docker 沙箱快照 / 锁 | **不用** | — | 已 `.disableShellTool()`，也没开容器沙箱 |
+
+**不要用 `MysqlDistributedStore.create(dataSource)`。** 它是「全套进 MySQL、不跑 Redis」的一键工厂，会一次装上：
+
+1. `MysqlAgentStateStore`（本项目已经单独接了）
+2. `JdbcStore` —— 工作区也进 MySQL，每轮读 MEMORY.md 变慢，大 jsonl 撑库
+3. `JdbcSnapshotSpec` / `JdbcSandboxExecutionGuard` —— 本项目用不到
+
+它还管不到网页 `SessionStore` 和 pending。另外 `create()` 内部是 `new MysqlAgentStateStore(ds, true)`，默认库名 **`agentscope`**，和 JDBC URL 里的 `agentscope_assistant` 对不上——官方 SQL 用 `` `库`.`表` ``，会写到别的库或再新建一个 `agentscope`。
+
+什么时候才换方案：
+
+- 连 Redis 都不想运 → 再考虑 `create()`，并接受工作区变慢、pending 要自己做超时
+- 只要最低延迟、能接受 Redis 丢数据 → AgentState 也回 Redis（官方多副本默认）
+- 文件特别大、要归档 → 工作区再考虑 OSS，不是 MySQL
+
+运维记住四条：`mysql.database` 必须和 JDBC URL 库名一致；Redis 给工作区开 AOF/RDB，否则 Java 重启对话还在、长期记忆可能没了；生产不要 `FLUSHDB` db=0；备份以 MySQL `agentscope_sessions` 为主。
+
+### 1.7 多用户与 HITL（必读）
 
 **（1）隔离靠二元组，不是靠「别传错 sessionId」**
 
@@ -168,7 +221,7 @@ sequenceDiagram
 
 - HTTP：POST body.`userId`；GET/DELETE 用 `X-User-Id` 或 `?userId=`
 - 空白 userId → `"local"`（兼容原来的单用户）
-- `UserIds` / `SessionIds` 挡住 `../`、`/`、空字节（会拼进 Redis key）
+- `UserIds` / `SessionIds` 挡住 `../`、`/`、空字节（会拼进 Redis key 和 MySQL 列）
 - Harness：`RuntimeContext.userId` + `IsolationScope.USER`，MEMORY.md 按用户分命名空间
 - HITL：`as:pending:{userId}:{sessionId}`，避免审批打到另一副本丢单
 
@@ -180,7 +233,7 @@ sequenceDiagram
 
 流结束后 `MemoryFlushMiddleware` 已经在后台写日流水。本项目的 `HarnessMemoryCatalog` **只读**。若再调模型覆盖 `MEMORY.md`，会和 `MemoryConsolidator` 打架。
 
-### 1.7 用本文源码复现项目
+### 1.8 用本文源码复现项目
 
 仓库里的 **主代码 + 测试 + 工作区模板 + `pom.xml` + `application.yml` + `index.html` + `.gitignore`** 下文均有对应内容（测试与工作区模板在下篇）；Java 已**省略 `import`**。
 
@@ -189,11 +242,12 @@ sequenceDiagram
 3. 只改配置里的密钥与模型接入点（本文已脱敏，**不能直接拿占位符去调模型**）：
    - `llm.base-url` / `llm.model`
    - `export LLM_API_KEY=...`（或写在 yml）
-   - 智谱搜索：`export MCP_API_KEY=...`，保持 MCP **0.17.0**
+   - 智谱搜索：`export MCP_API_KEY=...`（须是 open.bigmodel.cn 的 Key，不要用百炼 Key）；IDEA 可写 yml `mcp.api-key`。保持 MCP **0.17.0**。Working directory 设为本模块根
+   - MySQL：库名 `MYSQL_DATABASE`（默认 `agentscope_assistant`）。官方 `MysqlAgentStateStore(..., createIfNotExist=true)` 可自动建库建表
    - Redis：先 `redis-server`（默认 db=0）。**不要**再加 `distributed` profile
-4. `mvn spring-boot:run`，打开 http://localhost:8089 ，侧栏填「用户」。Redis ping 失败进程不会起来。
+4. `mvn spring-boot:run`，打开 http://localhost:8089 ，侧栏填「用户」。MySQL 或 Redis ping 失败进程不会起来。
 
-`workspace/` 启动时会建种子子目录。对话 / 记忆 / 网页会话都在 Redis，重启 Java **不会**丢；`FLUSHDB` db=0 或 Redis 无持久化重启才会丢。集成测试只清 **db=15**。免费额度耗尽时百炼会 403 `insufficient_quota`，与框架无关。
+`workspace/` 启动时会建种子子目录。对话状态在 MySQL `agentscope_sessions`，记忆 / 网页会话在 Redis。Java 重启不丢对话；Redis 无持久化重启会丢 MEMORY.md。清表或 `FLUSHDB` db=0 才会把对应后端清掉。Redis 集成测试只清 **db=15**。免费额度耗尽时百炼会 403 `insufficient_quota`，与框架无关。
 
 ---
 
@@ -226,14 +280,14 @@ public class DeepAssistantApplication {
 
 ### `src/main/java/cn/deepassistant/config/AgentScopeConfig.java`
 
-**作用：** 唯一装配入口。生产只走 Redis：模型、RemoteFilesystem、DistributedStore、分层记忆、压缩、Plan Mode、技能、写文件 ASK。启动 ping Redis，失败进程退出。已删除 `DistributedAgentScopeConfig` 与 `JsonFileAgentStateStore`。
+**作用：** 唯一装配入口。AgentState 走官方 `MysqlAgentStateStore`，工作区走 Redis RemoteFilesystem；再配 DistributedStore、分层记忆、压缩、Plan Mode、技能、写文件 ASK。启动连不上 MySQL 或 Redis 则进程退出。MCP 在 `build()` 前用 `McpServerRegistrar` 挂到父 Toolkit（Harness 2.0.1 会先快照子 Agent 再读 `tools.json`；isolated `research-agent` 工作区没有该文件）。`toolsConfig()` 只注入 deny，避免二次连 MCP。工作区路径经 `WorkspaceRoots` 解析。已删除自研 `MysqlAgentStateStore` / `RedisAgentStateStore` / `JsonFileAgentStateStore`。
 
 ```java
 package cn.deepassistant.config;
 
 /**
- * 把 AgentScope Java 2.0 Harness 接到 Spring。生产只走 Redis：
- * AgentState、工作区文件都进 {@link RemoteFilesystemSpec} + {@link DistributedStore}。
+ * 把 AgentScope Java 2.0 Harness 接到 Spring。AgentState 进 MySQL，
+ * 工作区文件进 Redis {@link RemoteFilesystemSpec} + {@link DistributedStore}。
  *
  * <p>对照官方文档（<a href="https://java.agentscope.io/v2/zh/docs/harness/memory.html">记忆</a>），
  * 不要再自己写一套「对话结束调模型抽 JSON」——框架已经有完整管线。
@@ -246,10 +300,14 @@ package cn.deepassistant.config;
  *   <li><b>大工具结果卸载</b>：{@code toolResultEviction}。单次工具输出太长时落盘，上下文只留预览。</li>
  *   <li><b>Plan Mode</b>：{@code enablePlanMode()}。只读规划，方案写到 {@code workspace/plans/}。</li>
  *   <li><b>技能仓库 / 自进化</b>：{@code enableSkillManageTool} + {@code enableSkillCurator}。</li>
- *   <li><b>子 Agent</b>：不 disable，工作区 {@code agents/} + {@code agent_spawn}。</li>
- *   <li><b>会话恢复</b>：Redis {@code AgentStateStore}，任意副本都能用 (userId, sessionId) 续跑。</li>
+ *   <li><b>子 Agent</b>：不 disable；官方自动加载 {@code workspace/subagents/*.md} + {@code agent_spawn}。</li>
+ *   <li><b>会话恢复</b>：官方 {@code MysqlAgentStateStore}，任意副本都能用 (userId, sessionId) 续跑。</li>
  *   <li><b>多用户隔离</b>：{@code IsolationScope.USER}。</li>
  *   <li><b>权限三态</b>：写文件 ASK，其余 BYPASS。</li>
+ *   <li><b>MCP</b>：工作区 {@code tools.json}。Harness 2.0.1 会先快照子 Agent Toolkit，
+ *       再在 {@code build()} 里注册 MCP；isolated 子工作区没有 {@code tools.json}，
+ *       所以必须在 {@code build()} 前 {@code McpServerRegistrar.register}，再
+ *       {@code toolsConfig()} 只注入 deny（避免二次连接）。不要 {@code disableToolsConfig()}。</li>
  * </ol>
  *
  * <p>刻意<b>不要</b>调用 {@code disableMemoryHooks()} / {@code disableMemoryTools()}。
@@ -270,7 +328,7 @@ public class AgentScopeConfig {
     private boolean enableThinking;
     @Value("${agent.workspace}")
     private String workspace;
-    @Value("${agent.max-iters:80}")
+    @Value("${agent.max-iters:25}")
     private int maxIters;
     @Value("#{'${agent.approval-tools:write_file,edit_file}'.split(',')}")
     private List<String> approvalTools;
@@ -290,6 +348,10 @@ public class AgentScopeConfig {
     private String redisPassword;
     @Value("${redis.database:0}")
     private int redisDatabase;
+    @Value("${mysql.database:agentscope_assistant}")
+    private String mysqlDatabase;
+    @Value("${mcp.api-key:}")
+    private String mcpApiKey;
 
     /**
      * 通过 AgentScope {@link ModelRegistry} 解析 OpenAI 兼容接口。
@@ -381,16 +443,23 @@ public class AgentScopeConfig {
         return conn;
     }
 
-    /** 同步命令接口，SessionStore / AgentState / BaseStore / Pending 共用这一条连接。 */
+    /** 同步命令接口，SessionStore / BaseStore / Pending 共用这一条连接。 */
     @Bean
     public RedisCommands<String, String> redisCommands(StatefulRedisConnection<String, String> conn) {
         return conn.sync();
     }
 
-    /** Harness 对话上下文（messages、权限、计划）的 Redis 实现。 */
+    /**
+     * 官方 {@link MysqlAgentStateStore}：对话上下文进 MySQL 表 {@code agentscope_sessions}。
+     * {@code createIfNotExist=true} 会按需建库建表。库名必须和 JDBC URL 一致，
+     * 因为官方 SQL 用 {@code `库`.`表`} 限定名。
+     */
     @Bean
-    public RedisAgentStateStore redisAgentStateStore(RedisCommands<String, String> redis) {
-        return new RedisAgentStateStore(redis);
+    public AgentStateStore mysqlAgentStateStore(DataSource dataSource) {
+        MysqlAgentStateStore store = new MysqlAgentStateStore(
+                dataSource, mysqlDatabase, "agentscope_sessions", true);
+        log.info("[MySQL] 官方 AgentState 已就绪 database={}", mysqlDatabase);
+        return store;
     }
 
     /** RemoteFilesystem 的 KV 后端：MEMORY.md、日流水、压缩卸载 jsonl。 */
@@ -400,11 +469,11 @@ public class AgentScopeConfig {
     }
 
     /**
-     * 官方分布式门面：同时塞 AgentState + BaseStore。
-     * RemoteFilesystem 构建时会检查这个 Bean，缺一不可。
+     * 官方分布式门面：AgentState 走 MySQL，工作区走 Redis BaseStore。
+     * 不要用 {@code MysqlDistributedStore.create}，那会把工作区也改成 JDBC。
      */
     @Bean
-    public DistributedStore distributedStore(RedisAgentStateStore stateStore,
+    public DistributedStore distributedStore(AgentStateStore stateStore,
                                              RedisBaseStore baseStore) {
         return DistributedStore.builder()
                 .agentStateStore(stateStore)
@@ -413,35 +482,34 @@ public class AgentScopeConfig {
     }
 
     /**
-     * 再暴露一遍 {@link AgentStateStore} 接口，给 {@code AssistantChatService} 按接口注入删会话。
-     */
-    @Bean
-    public AgentStateStore agentStateStore(RedisAgentStateStore redisAgentStateStore) {
-        return redisAgentStateStore;
-    }
-
-    /**
-     * 工作区走 RemoteFilesystem（Redis），状态走 DistributedStore。
+     * 工作区走 RemoteFilesystem（Redis），AgentState 走官方 MysqlAgentStateStore。
      * 官方要求 RemoteFilesystem 必须配分布式状态，否则 {@code build()} 抛 IllegalStateException。
      *
      * <p><b>何时调用：</b>Spring 启动 {@code build()} 一次。之后每次聊天
      * {@code AssistantChatService.streamEvents} 调 {@code harnessAgent.streamEvents}，
-     * 框架内部才会去调 Redis store、Toolkit 里的 {@code @Tool}、Flush 中间件。
+     * 框架内部才会去调 MySQL AgentState、Redis 工作区、Toolkit 里的 {@code @Tool}、Flush 中间件。
      */
     @Bean(destroyMethod = "close")
     public HarnessAgent harnessAgent(Model chatModel,
                                      DistributedStore distributedStore,
                                      MemoryConfig memoryConfig,
                                      CommonTools commonTools,
-                                     WebResearchTools webResearchTools,
                                      HistoryMemoryTools historyMemoryTools) throws Exception {
         Path ws = resolveAndInitWorkspace();
-        // 业务工具挂到同一 Toolkit；Harness 自带的 filesystem / memory / spawn 不在这里注册
+        exportMcpApiKey();
+        // 业务工具挂到同一 Toolkit；Harness 自带的 filesystem / memory / spawn 不在这里注册。
+        // MCP 必须在 build() 前挂上：框架会先用这份 Toolkit 快照子 Agent，之后才读 tools.json。
+        String mcpKey = firstNonBlank(System.getenv("MCP_API_KEY"), mcpApiKey);
+        ToolsConfig loadedTools = WorkspaceToolsConfigs.load(ws, mcpKey);
         Toolkit toolkit = new Toolkit();
         toolkit.registerTool(new TodoTools());
         toolkit.registerTool(commonTools);
-        toolkit.registerTool(webResearchTools);
         toolkit.registerTool(historyMemoryTools);
+        if (WorkspaceToolsConfigs.hasMcpServers(loadedTools)) {
+            McpServerRegistrar.register(toolkit, loadedTools.getMcpServers());
+            log.info("[Harness] MCP 已提前注册，isolated 子 Agent 可继承: {}",
+                    loadedTools.getMcpServers().keySet());
+        }
 
         // 默认 BYPASS：读文件、搜索、spawn 不弹窗。approval-tools（默认写/改文件）改成 ASK
         PermissionContextState.Builder perm = PermissionContextState.builder()
@@ -454,7 +522,7 @@ public class AgentScopeConfig {
             perm.addAskRule(name, new PermissionRule(name, null, PermissionBehavior.ASK, "policy"));
         }
 
-        HarnessAgent agent = HarnessAgent.builder()
+        HarnessAgent.Builder builder = HarnessAgent.builder()
                 .name("xiao-shen")
                 .sysPrompt("你是私人智能助手「小深」。人格与行为细则见工作区 AGENTS.md。"
                         + "跨会话事实以 MEMORY.md 为准；需要原文时用 memory_search / session_search / search_conversation_history。")
@@ -482,13 +550,64 @@ public class AgentScopeConfig {
                 .enableSkillManageTool(SkillManageConfig.defaults())
                 .enableSkillCurator(SkillCuratorConfig.defaults())
                 // 生产环境不给模型开宿主机 shell，避免误执行
-                .disableShellTool()
-                .build();
-        log.info("[Harness] workspace={} flushTrigger={} approvalTools={}",
+                .disableShellTool();
+        ToolsConfig filterOnly = WorkspaceToolsConfigs.filterOnly(loadedTools);
+        if (filterOnly != null) {
+            builder.toolsConfig(filterOnly);
+        }
+        HarnessAgent agent = builder.build();
+        List<String> mcpTools = mcpToolNames(agent);
+        if (mcpTools.isEmpty()) {
+            log.warn("[Harness] tools.json 的 MCP 未进入 Toolkit。检查 {}/tools.json、MCP_API_KEY，"
+                            + "以及 Could not read tools.json / Failed to register MCP server",
+                    ws);
+        }
+        log.info("[Harness] workspace={} flushTrigger={} approvalTools={} mcpApiKeyEnv={} mcpTools={} tools={}",
                 ws,
                 memoryConfig.flushTrigger(),
-                approvalTools == null ? List.of() : new ArrayList<>(approvalTools));
+                approvalTools == null ? List.of() : new ArrayList<>(approvalTools),
+                notBlank(System.getenv("MCP_API_KEY")),
+                mcpTools,
+                agent.getToolkit().getToolNames());
         return agent;
+    }
+
+    private static List<String> mcpToolNames(HarnessAgent agent) {
+        List<String> names = new ArrayList<>();
+        for (String name : agent.getToolkit().getToolNames()) {
+            if (agent.getToolkit().getTool(name) instanceof McpTool) {
+                names.add(name);
+            }
+        }
+        names.sort(String::compareTo);
+        return names;
+    }
+
+    /**
+     * {@code tools.json} 的 {@code ${MCP_API_KEY}} 只读 {@link System#getenv}（官方 ToolsConfigLoader）。
+     * 本地若只配了 yml，在 {@code build()} 前尽量补进进程环境。
+     */
+    private void exportMcpApiKey() {
+        String key = mcpApiKey;
+        if (!ProcessEnv.ensure("MCP_API_KEY", key)) {
+            log.warn("[Harness] MCP_API_KEY 未进入进程环境，将用 yml mcp.api-key 替换 tools.json 占位符");
+        }
+    }
+
+    private static String firstNonBlank(String... values) {
+        if (values == null) {
+            return null;
+        }
+        for (String value : values) {
+            if (notBlank(value)) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    private static boolean notBlank(String value) {
+        return value != null && !value.isBlank();
     }
 
     /**
@@ -499,7 +618,11 @@ public class AgentScopeConfig {
      * 用户 MEMORY.md / 日流水走 Redis {@link cn.deepassistant.redis.RedisBaseStore}。
      */
     Path resolveAndInitWorkspace() throws Exception {
-        Path ws = Path.of(workspace).toAbsolutePath().normalize();
+        Path configured = Path.of(workspace).toAbsolutePath().normalize();
+        Path ws = WorkspaceRoots.resolve(workspace, AgentScopeConfig.class);
+        if (!configured.equals(ws)) {
+            log.warn("[Harness] agent.workspace={} 没有 AGENTS.md/tools.json，改用 {}", configured, ws);
+        }
         Files.createDirectories(ws);
         Files.createDirectories(ws.resolve("memory"));
         Files.createDirectories(ws.resolve("skills"));
@@ -512,27 +635,101 @@ public class AgentScopeConfig {
 }
 ```
 
+### `src/main/java/cn/deepassistant/config/WorkspaceRoots.java`
+
+**作用：** IDEA Working directory 若指到别的工程，`${user.dir}/workspace` 没有种子文件。用本模块 `target/classes` 反推仓库里的 `workspace/`。
+
+```java
+package cn.deepassistant.config;
+
+/**
+ * 解析 Harness 种子工作区。yml 默认是 {@code ${user.dir}/workspace}，IntelliJ 若把
+ * Working directory 设成别的工程（例如 {@code IdeaProjects/agentscope}），那个目录没有
+ * {@code tools.json} / {@code AGENTS.md}。此时用本类 Class 的 {@code target/classes}
+ * 反推模块根下的 {@code workspace/}。
+ */
+public final class WorkspaceRoots {
+
+    private WorkspaceRoots() {
+    }
+
+    public static boolean hasSeeds(Path workspace) {
+        if (workspace == null) {
+            return false;
+        }
+        return Files.isRegularFile(workspace.resolve("AGENTS.md"))
+                || Files.isRegularFile(workspace.resolve("tools.json"));
+    }
+
+    public static Path resolve(String configured, Class<?> anchor) {
+        Path configuredPath = Path.of(
+                        configured == null || configured.isBlank() ? "workspace" : configured)
+                .toAbsolutePath()
+                .normalize();
+        if (hasSeeds(configuredPath)) {
+            return configuredPath;
+        }
+        Path fromCode = fromCodeSource(anchor);
+        if (hasSeeds(fromCode)) {
+            return fromCode;
+        }
+        return configuredPath;
+    }
+
+    static Path fromCodeSource(Class<?> anchor) {
+        if (anchor == null) {
+            return null;
+        }
+        try {
+            CodeSource source = anchor.getProtectionDomain().getCodeSource();
+            if (source == null) {
+                return null;
+            }
+            URL location = source.getLocation();
+            if (location == null) {
+                return null;
+            }
+            Path loc = Path.of(location.toURI()).toAbsolutePath().normalize();
+            if (Files.isRegularFile(loc)) {
+                Path parent = loc.getParent();
+                return parent == null ? null : parent.resolve("workspace");
+            }
+            Path target = loc.getParent();
+            if (target != null && "target".equals(target.getFileName().toString())) {
+                Path moduleRoot = target.getParent();
+                if (moduleRoot != null) {
+                    return moduleRoot.resolve("workspace");
+                }
+            }
+            return loc.resolve("workspace");
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+}
+```
+
 ### `DistributedAgentScopeConfig.java`（已删除）
 
-原先用 Spring profile `distributed` 分「单机 JSON / Redis」两套 Bean。现已并入上面的 `AgentScopeConfig`：**默认就是 Redis + RemoteFilesystem**，不需要 `--spring.profiles.active=distributed`。
+原先用 Spring profile `distributed` 分「单机 JSON / Redis」两套 Bean。现已并入上面的 `AgentScopeConfig`：**AgentState 走 MySQL，工作区走 Redis RemoteFilesystem**，不需要 `--spring.profiles.active=distributed`。
 
 ---
 
-## 三、分布式状态（Redis）
+## 三、分布式状态（MySQL AgentState + Redis 工作区）
+
+存储怎么选见上文 **§1.6**。这里只贴接线。一句话：**对话状态进 MySQL 求稳，热文件和短生命周期进 Redis 求快；`MysqlDistributedStore.create()` 不是更高级的写法。**
 
 ### `src/main/java/cn/deepassistant/redis/package-info.java`
 
-**作用：** 为什么官方 RemoteFilesystem 必须配分布式 AgentState
+**作用：** 为什么官方 RemoteFilesystem 必须配分布式 AgentState（后端可以不是 Redis）
 
 ```java
 /**
- * Redis 生产存储：AgentState、工作区文件、网页会话、HITL 待审批都进同一套 Redis，多副本共享。
- * 没有单机 JSON / LocalFilesystem 运行时模式，也没有 {@code distributed} profile。
+ * Redis 生产存储：工作区文件、网页会话、HITL 待审批进同一套 Redis，多副本共享。
+ * AgentState（对话上下文）用官方 {@link io.agentscope.extensions.mysql.state.MysqlAgentStateStore}。
  *
  * <ul>
- *   <li>{@link RedisAgentStateStore} —— 对话上下文、权限、计划。框架 {@code ReActAgent.streamEvents}
- *       开头 {@code get}（槽位 {@code agent_state}）、过程中/结束后 {@code save}</li>
- *   <li>{@link RedisBaseStore} —— MEMORY.md、日流水、压缩卸载 jsonl。由官方 {@code RemoteFilesystem} 回调</li>
+ *   <li>{@link RedisBaseStore} —— MEMORY.md、日流水、压缩卸载 jsonl（RemoteFilesystem）</li>
  *   <li>{@link RedisPendingApprovalStore} —— 写文件审批单，避免打到另一副本丢 pending</li>
  * </ul>
  *
@@ -542,170 +739,45 @@ public class AgentScopeConfig {
 package cn.deepassistant.redis;
 ```
 
-### `src/main/java/cn/deepassistant/redis/RedisAgentStateStore.java`
+### `io.agentscope.extensions.mysql.state.MysqlAgentStateStore`（官方，`agentscope-extensions-mysql`）
 
-**作用：** AgentState 存 Redis。**谁在调：** 几乎全是 AgentScope 框架——`streamEvents` 开头 `get`、回合中/结束后 `save`；本项目删会话时才会 `delete`。
+**作用：** AgentState 存 MySQL。本项目只接线，不自研 store。**谁在调：** 几乎全是 AgentScope 框架——`streamEvents` 开头 `get`、回合中/结束后 `save`；本项目删会话时才会 `delete`。
+
+依赖：`io.agentscope:agentscope-extensions-mysql:${agentscope.version}`。文档：<https://java.agentscope.io/v2/en/integration/session/mysql.html>
 
 ```java
-package cn.deepassistant.redis;
-
-/**
- * Redis 版 {@link AgentStateStore}：把 AgentState 存进 Redis，多副本共享。
- *
- * <h3>Key 设计</h3>
- * <pre>
- *   单条状态：  as:state:{userId}:{sessionId}:{slotName}   →  JSON 字符串
- *   列表状态：  as:list:{userId}:{sessionId}:{slotName}    →  Redis LIST（每行一个 JSON）
- * </pre>
- * userId / sessionId 只允许 {@code [a-zA-Z0-9_-]}（见 UserIds / SessionIds），
- * 所以用 {@code :} 当分隔符不会撞。
- *
- * <p>序列化用 {@link JsonUtils#getJsonCodec()}，和 {@link io.agentscope.core.state.JsonFileAgentStateStore}
- * 完全一致——单机 JSON 文件迁到 Redis 不用转格式，反之亦然。
- *
- * <p>列表状态用 Redis LIST（RPUSH 一行一个 JSON）。{@link #save} 列表时做全量重写
- * （DEL + RPUSH），比 JsonFile 的增量追加简单，量级不大时性能足够。
- */
-@Slf4j
-public class RedisAgentStateStore implements AgentStateStore {
-
-    private static final String STATE_PREFIX = "as:state:";
-    private static final String LIST_PREFIX = "as:list:";
-
-    private final RedisCommands<String, String> redis;
-
-    public RedisAgentStateStore(RedisCommands<String, String> redis) {
-        this.redis = redis;
-    }
-
-    private static String stateKey(String userId, String sessionId, String slotName) {
-        return STATE_PREFIX + userId + ":" + sessionId + ":" + slotName;
-    }
-
-    private static String listKey(String userId, String sessionId, String slotName) {
-        return LIST_PREFIX + userId + ":" + sessionId + ":" + slotName;
-    }
-
-    /** 单条状态：序列化成 JSON 存一个 String key。 */
-    @Override
-    public void save(String userId, String sessionId, String slotName, State state) {
-        String json = JsonUtils.getJsonCodec().toPrettyJson(state);
-        redis.set(stateKey(userId, sessionId, slotName), json);
-    }
-
-    /** 列表状态：全量重写（DEL + RPUSH 每行一个 JSON）。 */
-    @Override
-    public void save(String userId, String sessionId, String slotName,
-                     List<? extends State> states) {
-        String key = listKey(userId, sessionId, slotName);
-        redis.del(key);
-        if (states == null || states.isEmpty()) {
-            return;
-        }
-        String[] jsons = new String[states.size()];
-        for (int i = 0; i < states.size(); i++) {
-            jsons[i] = JsonUtils.getJsonCodec().toPrettyJson(states.get(i));
-        }
-        redis.rpush(key, jsons);
-    }
-
-    @Override
-    public <T extends State> Optional<T> get(String userId, String sessionId, String slotName, Class<T> type) {
-        String json = redis.get(stateKey(userId, sessionId, slotName));
-        if (json == null || json.isBlank()) {
-            return Optional.empty();
-        }
-        try {
-            return Optional.of(JsonUtils.getJsonCodec().fromJson(json, type));
-        } catch (Exception e) {
-            log.warn("[RedisState] 反序列化失败 {}/{}/{}: {}", userId, sessionId, slotName, e.getMessage());
-            return Optional.empty();
-        }
-    }
-
-    @Override
-    public <T extends State> List<T> getList(String userId, String sessionId, String slotName, Class<T> type) {
-        List<String> jsons = redis.lrange(listKey(userId, sessionId, slotName), 0, -1);
-        List<T> result = new ArrayList<>();
-        for (String json : jsons) {
-            if (json == null || json.isBlank()) {
-                continue;
-            }
-            try {
-                result.add(JsonUtils.getJsonCodec().fromJson(json, type));
-            } catch (Exception e) {
-                log.warn("[RedisState] 列表项反序列化失败 {}/{}/{}: {}", userId, sessionId, slotName, e.getMessage());
-            }
-        }
-        return result;
-    }
-
-    /** 该 (userId, sessionId) 是否存过任何状态。 */
-    @Override
-    public boolean exists(String userId, String sessionId) {
-        String stateMatch = STATE_PREFIX + userId + ":" + sessionId + ":*";
-        String listMatch = LIST_PREFIX + userId + ":" + sessionId + ":*";
-        return !scanKeys(stateMatch).isEmpty() || !scanKeys(listMatch).isEmpty();
-    }
-
-    /** 删整个会话：扫两种前缀全删。 */
-    @Override
-    public void delete(String userId, String sessionId) {
-        String stateMatch = STATE_PREFIX + userId + ":" + sessionId + ":*";
-        String listMatch = LIST_PREFIX + userId + ":" + sessionId + ":*";
-        delAll(scanKeys(stateMatch));
-        delAll(scanKeys(listMatch));
-    }
-
-    /** 删单个槽位：删单条 key + 列表 key。 */
-    @Override
-    public void delete(String userId, String sessionId, String slotName) {
-        redis.del(stateKey(userId, sessionId, slotName));
-        redis.del(listKey(userId, sessionId, slotName));
-    }
-
-    /** 列出某用户的所有 sessionId：扫 as:state:{userId}:* 和 as:list:{userId}:* 取第三段。 */
-    @Override
-    public Set<String> listSessionIds(String userId) {
-        Set<String> ids = new TreeSet<>();
-        String stateMatch = STATE_PREFIX + userId + ":*";
-        String listMatch = LIST_PREFIX + userId + ":*";
-        for (String key : scanKeys(stateMatch)) {
-            ids.add(extractSessionId(key, STATE_PREFIX));
-        }
-        for (String key : scanKeys(listMatch)) {
-            ids.add(extractSessionId(key, LIST_PREFIX));
-        }
-        return ids;
-    }
-
-    /** as:state:{userId}:{sessionId}:{slotName} → 取 sessionId 段。 */
-    private static String extractSessionId(String key, String prefix) {
-        String rest = key.substring(prefix.length());
-        int first = rest.indexOf(':');
-        int second = rest.indexOf(':', first + 1);
-        return second < 0 ? rest.substring(first + 1) : rest.substring(first + 1, second);
-    }
-
-    private Set<String> scanKeys(String pattern) {
-        Set<String> keys = new HashSet<>();
-        ScanCursor cursor = ScanCursor.INITIAL;
-        do {
-            var scan = redis.scan(cursor, ScanArgs.Builder.matches(pattern).limit(200));
-            keys.addAll(scan.getKeys());
-            cursor = scan;
-        } while (!cursor.isFinished());
-        return keys;
-    }
-
-    private void delAll(Set<String> keys) {
-        if (keys.isEmpty()) {
-            return;
-        }
-        redis.del(keys.toArray(new String[0]));
-    }
+@Bean
+public AgentStateStore mysqlAgentStateStore(DataSource dataSource) {
+    // 库名必须和 JDBC URL 一致；官方 SQL 用 `库`.`表` 限定名
+    return new MysqlAgentStateStore(dataSource, mysqlDatabase, "agentscope_sessions", true);
 }
 ```
+
+表由官方自动建（`createIfNotExist=true`）：
+
+```sql
+CREATE TABLE IF NOT EXISTS agentscope_sessions (
+    session_id VARCHAR(255) NOT NULL,
+    state_key  VARCHAR(255) NOT NULL,
+    item_index INT NOT NULL DEFAULT 0,
+    state_data LONGTEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (session_id, state_key, item_index)
+) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+```
+
+`(userId, sessionId)` 打进 `session_id` 列，格式 `{userId}:{sessionId}`。单槽 `item_index=0`；列表槽按行递增。
+
+本项目用 `DistributedStore.builder()` 混搭，**不要** `MysqlDistributedStore.create()`：后者会把 `baseStore` 换成 `JdbcStore`（工作区进 MySQL），并带上用不到的沙箱快照 / `GET_LOCK()`；网页会话和 pending 它也管不到。库名必须显式传入 `agentscope_assistant`，不能用 `create()` 默认的 `agentscope`。
+
+### `src/main/java/cn/deepassistant/mysql/MysqlAgentStateStore.java`（已删除）
+
+原先自研两张表 `agent_state` / `agent_state_list`。已换成上面的官方实现。
+
+### `src/main/java/cn/deepassistant/redis/RedisAgentStateStore.java`（已删除）
+
+原先把 AgentState 放 Redis `as:state:` / `as:list:`。现已换成官方 MySQL store。工作区 / 网页会话 / pending 仍走 Redis。
 
 ### `src/main/java/cn/deepassistant/redis/RedisBaseStore.java`
 
@@ -736,6 +808,18 @@ package cn.deepassistant.redis;
  * <p>value 是 {@link StoreItem#value()}（{@code Map<String, Object>}）的 JSON，
  * 官方 {@code RemoteFilesystem.fileDataToStoreValue} 负责在 FileData ↔ Map 之间转换，
  * 本类只管忠实存取 Map，不关心里面是什么。
+ *
+ * <h3>谁在调（几乎全是 AgentScope {@code RemoteFilesystem}）</h3>
+ * Harness 配了 {@code RemoteFilesystemSpec} 后，工作区读写不再碰本地磁盘，全部变成对本接口的 KV。
+ * 本项目从不直接 {@code redisBaseStore.get/put}，而是框架在这些时机回调：
+ * <ul>
+ *   <li>每轮推理开头 {@code WorkspaceContextMiddleware} 读 {@code MEMORY.md} / {@code AGENTS.md} 注入 system prompt</li>
+ *   <li>模型调 {@code read_file}/{@code write_file}/{@code edit_file}/{@code ls}/{@code grep}/{@code glob}</li>
+ *   <li>流结束后 {@code MemoryFlushMiddleware} 追加 {@code memory/YYYY-MM-DD.md}</li>
+ *   <li>周期性 {@code MemoryConsolidator} 重写 {@code MEMORY.md}</li>
+ *   <li>上下文压缩 {@code CompactionMiddleware} 把卸下来的原文写成 {@code sessions/*.log.jsonl}</li>
+ *   <li>本项目档案页 / {@code get_user_usage} 经 {@code WorkspaceManager} 间接触达（仍是框架文件系统）</li>
+ * </ul>
  */
 @Slf4j
 public class RedisBaseStore implements BaseStore {
@@ -759,6 +843,13 @@ public class RedisBaseStore implements BaseStore {
         return PREFIX + String.join("/", namespace) + "/";
     }
 
+    /**
+     * 读一个工作区文件对应的 Hash。没有 key 返回 null，官方 RemoteFilesystem 会当成文件不存在。
+     *
+     * <p><b>何时调用（框架）：</b>{@code RemoteFilesystem.read}/{@code exists}，以及
+     * {@code WorkspaceManager.readMemoryMd} / {@code readManagedWorkspaceFileUtf8}。
+     * 典型时机：每轮 chat 开头注入 MEMORY.md；模型 {@code read_file}；Flush/Consolidation 先读再写。
+     */
     @Override
     public StoreItem get(List<String> namespace, String key) {
         String rk = redisKey(namespace, key);
@@ -772,6 +863,12 @@ public class RedisBaseStore implements BaseStore {
         return new StoreItem(key, value, version);
     }
 
+    /**
+     * 无条件写入：Lua 里 HINCRBY version + HSET value，一次 eval 保证不会出现「只加了版本没写内容」。
+     *
+     * <p><b>何时调用（框架）：</b>{@code RemoteFilesystem.write} 在「文件尚不存在」时走 put
+     * （已存在则官方要求先 read 再 edit）。新建日流水、新建计划、压缩卸载 jsonl 第一次落盘都会进这里。
+     */
     @Override
     public void put(List<String> namespace, String key, Map<String, Object> value) {
         String rk = redisKey(namespace, key);
@@ -784,6 +881,14 @@ public class RedisBaseStore implements BaseStore {
         redis.eval(script, ScriptOutputType.INTEGER, new String[]{rk}, valueJson);
     }
 
+    /**
+     * 乐观锁写入。当前 version 必须等于 {@code expectedVersion} 才提交，否则返回 false 让框架重读再试。
+     * 多副本同时 flush MEMORY.md 时靠这个避免互相覆盖。
+     *
+     * <p><b>何时调用（框架）：</b>{@code RemoteFilesystem.write}/{@code edit} 改已有文件时。
+     * 官方最多重试 5 次；失败会报 {@code Another writer is concurrently modifying this file}。
+     * Consolidation 重写 MEMORY.md、模型 {@code edit_file}、Flush 追加日流水都走这条。
+     */
     @Override
     public boolean putIfVersion(List<String> namespace, String key,
                                Map<String, Object> value, long expectedVersion) {
@@ -804,6 +909,14 @@ public class RedisBaseStore implements BaseStore {
         return r != null && r == 1L;
     }
 
+    /**
+     * 列出某用户命名空间下的文件：SCAN 前缀 → 排序 → 按 offset/limit 切片再 HGETALL。
+     *
+     * <p><b>何时调用（框架）：</b>{@code RemoteFilesystem.ls}/{@code glob}/{@code grep} 的
+     * {@code searchAllItems}，以及 {@code WorkspaceManager.listMemoryFilePaths} /
+     * {@code listSessionLogFiles}。模型列目录、官方 {@code memory_search}/{@code session_search}、
+     * 档案页列日流水都会间接触达。
+     */
     @Override
     public List<StoreItem> search(List<String> namespace, int limit, int offset) {
         String prefix = scanPrefix(namespace);
@@ -828,6 +941,12 @@ public class RedisBaseStore implements BaseStore {
         return items;
     }
 
+    /**
+     * 删单个工作区文件对应的 Hash。
+     *
+     * <p><b>何时调用（框架）：</b>{@code RemoteFilesystem.delete}/{@code move}（move = 读新位置 put + 删旧 key）。
+     * 模型调删文件工具、技能迁移 {@code moveSkill} 时会进这里。本项目 HTTP 删会话<b>不会</b>清工作区文件。
+     */
     @Override
     public void delete(List<String> namespace, String key) {
         redis.del(redisKey(namespace, key));
@@ -835,10 +954,12 @@ public class RedisBaseStore implements BaseStore {
 
     // ---- 工具 ----
 
+    /** {@code as:base:alice/MEMORY.md} 去掉前缀后得到官方要的 fileKey {@code MEMORY.md}。 */
     private static String stripPrefix(String rk, String prefix) {
         return rk.startsWith(prefix) ? rk.substring(prefix.length()) : rk;
     }
 
+    /** Hash 里的 version 转 long；缺字段或非数字用默认值，避免一次脏数据让 search 整页失败。 */
     private static long parseLong(String s, long def) {
         if (s == null || s.isBlank()) {
             return def;
@@ -850,6 +971,7 @@ public class RedisBaseStore implements BaseStore {
         }
     }
 
+    /** SCAN 匹配，不用 KEYS。 */
     private Set<String> scanKeys(String pattern) {
         Set<String> keys = new HashSet<>();
         ScanCursor cursor = ScanCursor.INITIAL;
@@ -894,6 +1016,9 @@ package cn.deepassistant.redis;
 
 /**
  * HITL 待审批跨副本共享。key = {@code as:pending:{userId}:{sessionId}}，TTL 1 小时。
+ *
+ * <p>写文件工具触发 ASK 后，审批单必须进 Redis：用户点「批准」可能打到另一台副本，
+ * 那台机器内存里没有当初的 {@link ToolUseBlock}。TTL 防止用户关掉页面后 key 永久残留。
  */
 @Slf4j
 @Component
@@ -901,6 +1026,7 @@ package cn.deepassistant.redis;
 public class RedisPendingApprovalStore {
 
     private static final String PREFIX = "as:pending:";
+    /** 一小时没人点批准/拒绝就作废，避免幽灵审批。 */
     private static final long TTL_SECONDS = 3600;
 
     private final RedisCommands<String, String> redis;
@@ -910,6 +1036,12 @@ public class RedisPendingApprovalStore {
         return PREFIX + userId + ":" + sessionId;
     }
 
+    /**
+     * 覆盖写入待审批工具列表，并刷新 TTL。序列化失败直接抛，宁可本轮失败也不能丢审批单。
+     *
+     * <p><b>何时调用：</b>本项目 {@code AssistantChatService.run} 收到框架
+     * {@code RequireUserConfirmEvent} 之后。AgentScope 自己不写这个 Redis key。
+     */
     public void put(String userId, String sessionId, List<ToolUseBlock> toolCalls) {
         try {
             redis.setex(key(userId, sessionId), TTL_SECONDS, mapper.writeValueAsString(toolCalls));
@@ -918,6 +1050,11 @@ public class RedisPendingApprovalStore {
         }
     }
 
+    /**
+     * 读待审批列表。没有 key 或 JSON 坏了返回 null，调用方当成「当前没有待审批」。
+     *
+     * <p><b>何时调用：</b>{@code POST /api/assistant/resume} 组 {@code ConfirmResult} 之前。
+     */
     public List<ToolUseBlock> get(String userId, String sessionId) {
         String json = redis.get(key(userId, sessionId));
         if (json == null || json.isBlank()) {
@@ -932,11 +1069,19 @@ public class RedisPendingApprovalStore {
         }
     }
 
+    /** Redis EXISTS：前端打开历史会话时用来决定要不要显示批准按钮。
+     *
+     * <p><b>何时调用：</b>{@code GET /api/sessions/{id}}、resume 入口校验。
+     */
     public boolean exists(String userId, String sessionId) {
         Long n = redis.exists(key(userId, sessionId));
         return n != null && n > 0;
     }
 
+    /** 对话正常结束、拒绝跑完、或删除会话时清掉审批单。
+     *
+     * <p><b>何时调用：</b>{@code AssistantChatService.run} 正常收尾；{@code clearSessionMemory}。
+     */
     public void remove(String userId, String sessionId) {
         redis.del(key(userId, sessionId));
     }
@@ -954,7 +1099,7 @@ public class RedisPendingApprovalStore {
  * 记忆分三层，对应 AgentScope Java 2.0 官方文档，而不是原 LangGraph 项目自己的 MemoryStore。
  *
  * <pre>
- *  ① 短期：当前会话 messages（Redis AgentState）+ 本项目 SessionStore（网页侧栏，Redis as:web:）
+ *  ① 短期：当前会话 messages（MySQL AgentState）+ 本项目 SessionStore（网页侧栏，Redis as:web:）
  *  ② 中期日流水：memory/YYYY-MM-DD.md（RemoteFilesystem → Redis）
  *       由官方 MemoryFlushMiddleware 在每次 call 结束后后台抽取（只追加、不去重）
  *  ③ 长期策划：MEMORY.md（同上）
@@ -988,7 +1133,7 @@ package cn.deepassistant.memory;
  * {@link WorkspaceManager#readMemoryMd(RuntimeContext)} /
  * {@link WorkspaceManager#listMemoryFilePaths(RuntimeContext)} /
  * {@link WorkspaceManager#readManagedWorkspaceFileUtf8(RuntimeContext, String)}，
- * 保证和框架写入的路径完全一致——Local / Remote 文件系统都兼容。
+ * 保证和框架写入的路径完全一致（RemoteFilesystem / Redis）。
  *
  * <h3>为什么用 {@link ObjectProvider} 而不是直接注入 {@link HarnessAgent}</h3>
  * 存在循环依赖：{@code harnessAgent (bean) → historyMemoryTools → harnessMemoryCatalog → harnessAgent}。
@@ -1013,7 +1158,11 @@ public class HarnessMemoryCatalog {
         this.harnessAgentProvider = harnessAgentProvider;
     }
 
-    /** 首次调用时从 harnessAgent 拿 WorkspaceManager，之后缓存。 */
+    /** 首次调用时从 harnessAgent 拿 WorkspaceManager，之后缓存。
+     *
+     * <p><b>何时调用：</b>本类第一次读记忆文件时（档案页或 {@code get_user_usage} 工具）。
+     * 不能在构造期调，否则和 HarnessAgent Bean 循环依赖。
+     */
     private WorkspaceManager workspaceManager() {
         WorkspaceManager wm = workspaceManager;
         if (wm == null) {
@@ -1029,13 +1178,24 @@ public class HarnessMemoryCatalog {
         return wm;
     }
 
-    /** 读指定用户的 MEMORY.md。 */
+    /**
+     * 读指定用户的 MEMORY.md。
+     *
+     * <p><b>何时调用：</b>{@code GET /api/memory}、工具 {@code get_user_usage}。
+     * 内部是官方 {@code WorkspaceManager.readMemoryMd}，会再进 {@code RemoteFilesystem} → RedisBaseStore.get。
+     * 写 MEMORY.md 的是框架 Consolidator，不是这个方法。
+     */
     public String readMemoryMarkdown(String userId) {
         String uid = UserIds.normalize(userId);
         return workspaceManager().readMemoryMd(runtimeContext(uid));
     }
 
-    /** 列指定用户的日流水文件。用官方 WorkspaceManager 列路径，再逐个读内容——Local/Remote 文件系统都兼容。 */
+    /**
+     * 列指定用户的日流水文件。用官方 WorkspaceManager 列路径，再逐个读内容。
+     *
+     * <p><b>何时调用：</b>{@code GET /api/memory}、工具 {@code get_user_usage}。
+     * {@code listMemoryFilePaths} 在框架里会 {@code RemoteFilesystem} search。
+     */
     public List<DailyMemoryFile> listDailyLedgers(String userId) {
         String uid = UserIds.normalize(userId);
         RuntimeContext ctx = runtimeContext(uid);
@@ -1068,12 +1228,17 @@ public class HarnessMemoryCatalog {
     /**
      * 把指定用户 MEMORY.md 里的 {@code - 条目} 拆成列表，给档案页用。
      * 分类只能从当前小节标题猜，猜不到就叫 {@code fact}。
+     *
+     * <p><b>何时调用：</b>仅 {@code GET /api/memory}。AgentScope 不调。
      */
     public List<MemoryFact> parseFactsFromMemoryMd(String userId) {
         return parseFacts(readMemoryMarkdown(userId));
     }
 
-    /** 纯函数，方便单测：不碰磁盘。 */
+    /** 纯函数，方便单测：不碰磁盘。
+     *
+     * <p><b>何时调用：</b>{@link #parseFactsFromMemoryMd} 以及单测。
+     */
     static List<MemoryFact> parseFacts(String md) {
         List<MemoryFact> facts = new ArrayList<>();
         if (md == null || md.isBlank()) {
@@ -1123,6 +1288,11 @@ public class HarnessMemoryCatalog {
         return "fact";
     }
 
+    /**
+     * 只带 userId 的 RuntimeContext，给 WorkspaceManager 做 IsolationScope.USER 路由。
+     *
+     * <p><b>何时调用：</b>本类读记忆时。不需要 sessionId：MEMORY.md 是用户级，不是会话级。
+     */
     private static RuntimeContext runtimeContext(String userId) {
         return RuntimeContext.builder()
                 .userId(userId)
@@ -1523,10 +1693,12 @@ public class SessionStore {
 ```java
 package cn.deepassistant.service;
 
-/**
- * HTTP 门面：历史检索走 SessionStore，档案页读官方 MEMORY.md / 日流水。
- * 所有方法都按 userId 隔离，不同用户互不可见。
- */
+    /**
+     * HTTP 门面：历史检索走 SessionStore，档案页读官方 MEMORY.md / 日流水。
+     * 所有方法都按 userId 隔离，不同用户互不可见。
+     *
+     * <p><b>何时调用：</b>只被 {@code AssistantController} 的 GET 接口调。AgentScope 不进这个类。
+     */
 @Service
 public class UserMemoryQueryService {
 
@@ -1538,6 +1710,11 @@ public class UserMemoryQueryService {
         this.memoryCatalog = memoryCatalog;
     }
 
+    /**
+     * 网页会话库关键词检索。
+     *
+     * <p><b>何时调用：</b>{@code GET /api/history/search}。模型搜历史走 {@code HistoryMemoryTools}，不走这里。
+     */
     public HistorySearchResponse searchHistory(String userId, String query, int limit) {
         String uid = UserIds.normalize(userId);
         String q = query == null ? "" : query.trim();
@@ -1549,6 +1726,11 @@ public class UserMemoryQueryService {
                 .build();
     }
 
+    /**
+     * 档案页一次聚合：用量 + MEMORY.md + 日流水 + 解析出的 facts。
+     *
+     * <p><b>何时调用：</b>{@code GET /api/memory}。读 MEMORY.md 会间接触达框架 WorkspaceManager / RedisBaseStore。
+     */
     public UserMemoryProfile profile(String userId) {
         String uid = UserIds.normalize(userId);
         return UserMemoryProfile.builder()
@@ -1580,7 +1762,7 @@ public final class UserIds {
     private static final Pattern SAFE =
             Pattern.compile("^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$");
 
-    /** 单机个人助手没传 userId 时的默认值，保持向后兼容。 */
+    /** 请求没带 userId 时的默认值。 */
     public static final String DEFAULT_USER_ID = "local";
 
     private UserIds() {
@@ -1589,6 +1771,9 @@ public final class UserIds {
     /**
      * 校验 userId，空白时回退到 {@link #DEFAULT_USER_ID}。
      * 这样前端不传 userId 也能跑，等价于原来的单用户模式。
+     *
+     * <p><b>何时调用：</b>几乎所有 HTTP 入口和工具里取当前用户时。AgentScope 用的是
+     * {@code RuntimeContext.userId}，不会调这个方法；我们在进框架前先 normalize 再放进 Context。
      */
     public static String normalize(String userId) {
         if (userId == null || userId.isBlank()) {
@@ -1597,11 +1782,16 @@ public final class UserIds {
         return requireValid(userId);
     }
 
+    /**
+     * 强制校验：空白也报错，不回退到 {@code local}。
+     * 给「必须明确知道是哪个用户」的内部调用预留；HTTP 入口一般用 {@link #normalize}。
+     */
     public static String requireValid(String userId) {
         if (userId == null || userId.isBlank()) {
             throw new IllegalArgumentException("userId 为空");
         }
         String id = userId.trim();
+        // 先挡路径穿越，再套白名单，避免奇怪 unicode 绕过正则
         if (id.contains("..") || id.contains("/") || id.contains("\\") || id.indexOf('\0') >= 0) {
             throw new IllegalArgumentException("非法 userId");
         }
@@ -1620,6 +1810,13 @@ public final class UserIds {
 ```java
 package cn.deepassistant.util;
 
+/**
+ * sessionId 校验与生成。规则与 {@link UserIds} 相同：只允许字母数字开头，后跟字母数字、下划线、短横，
+ * 最长 128，禁止 {@code ..} / {@code /} / {@code \\} / {@code \0}。
+ *
+ * <p>id 会拼进 Redis key（{@code as:web:}）和官方 MySQL 槽位
+ * {@code {userId}:{sessionId}}，必须挡住路径穿越和分隔符注入。
+ */
 public final class SessionIds {
 
     private static final Pattern SAFE =
@@ -1628,10 +1825,15 @@ public final class SessionIds {
     private SessionIds() {
     }
 
+    /** 新会话 id：标准 UUID 字符串，符合 {@link #SAFE}。 */
     public static String newId() {
         return UUID.randomUUID().toString();
     }
 
+    /**
+     * 校验已有 sessionId。空白或格式非法抛 {@link IllegalArgumentException}，
+     * 由 Controller 转成 SSE error 或 HTTP 400。
+     */
     public static String requireValid(String sessionId) {
         if (sessionId == null || sessionId.isBlank()) {
             throw new IllegalArgumentException("sessionId 为空");
@@ -1646,6 +1848,13 @@ public final class SessionIds {
         return id;
     }
 
+    /**
+     * 聊天入口专用：没带 id 就现场生成；带了就校验。
+     * 续跑 / 打开历史必须走 {@link #requireValid}，不能悄悄新建一条对不上的会话。
+     *
+     * <p><b>何时调用：</b>{@code POST /api/assistant/chat}、{@code SessionStore.getOrCreate}。
+     * AgentScope 不生成网页 sessionId，只用我们放进 {@code RuntimeContext.sessionId} 的值。
+     */
     public static String normalizeOrCreate(String sessionId) {
         if (sessionId == null || sessionId.isBlank()) {
             return newId();
@@ -1654,8 +1863,6 @@ public final class SessionIds {
     }
 }
 ```
-
-
 ---
 
-**下篇：** [小深-AgentScope-Java-2.0-Harness架构博客-02.md](./小深-AgentScope-Java-2.0-Harness架构博客-02.md) — 工具、MCP/REST 联网、对话 SSE、前端与踩坑笔记。
+**下篇：** [小深-AgentScope-Java-2.0-Harness架构博客-02.md](./小深-AgentScope-Java-2.0-Harness架构博客-02.md) — 工具、官方 tools.json MCP、对话 SSE、前端与踩坑笔记。

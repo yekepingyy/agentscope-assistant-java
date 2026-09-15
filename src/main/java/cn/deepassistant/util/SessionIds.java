@@ -7,7 +7,8 @@ import java.util.regex.Pattern;
  * sessionId 校验与生成。规则与 {@link UserIds} 相同：只允许字母数字开头，后跟字母数字、下划线、短横，
  * 最长 128，禁止 {@code ..} / {@code /} / {@code \\} / {@code \0}。
  *
- * <p>id 会拼进 Redis key（{@code as:web:}、{@code as:state:}），必须挡住路径穿越和分隔符注入。
+ * <p>id 会拼进 Redis key（{@code as:web:}）和官方 MySQL 槽位
+ * {@code {userId}:{sessionId}}，必须挡住路径穿越和分隔符注入。
  */
 public final class SessionIds {
 

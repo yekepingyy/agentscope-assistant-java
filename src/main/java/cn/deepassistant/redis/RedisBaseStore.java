@@ -89,6 +89,10 @@ public class RedisBaseStore implements BaseStore {
         String valueJson = fields.getOrDefault("value", "");
         long version = parseLong(fields.get("version"), 0L);
         Map<String, Object> value = JsonCodecHolder.fromJsonToMap(valueJson);
+        if (value == null) {
+            log.warn("[RedisBaseStore] value 损坏，视为不存在");
+            return null;
+        }
         return new StoreItem(key, value, version);
     }
 
@@ -163,6 +167,9 @@ public class RedisBaseStore implements BaseStore {
             String valueJson = fields.getOrDefault("value", "");
             long version = parseLong(fields.get("version"), 0L);
             Map<String, Object> value = JsonCodecHolder.fromJsonToMap(valueJson);
+            if (value == null) {
+                continue;
+            }
             // itemKey = 去掉前缀 + namespace/，剩下的是 fileKey
             String itemKey = stripPrefix(rk, prefix);
             items.add(new StoreItem(itemKey, value, version));
@@ -229,7 +236,7 @@ public class RedisBaseStore implements BaseStore {
                         });
             } catch (Exception e) {
                 log.warn("[RedisBaseStore] value 反序列化失败: {}", e.getMessage());
-                return Map.of();
+                return null;
             }
         }
     }

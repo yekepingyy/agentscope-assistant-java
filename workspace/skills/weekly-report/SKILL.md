@@ -1,6 +1,6 @@
 ---
 name: weekly-report
-description: 周报撰写规范：固定章节、字数与语气。需要写周报时先加载本技能再按规范落盘。
+description: 用户说「周报」「weekly report」「写周报」时必须先加载本技能，再按固定四章写到 reports/weekly-YYYYMMDD.md。不要跳过本技能直接写文件。
 ---
 
 # 周报技能

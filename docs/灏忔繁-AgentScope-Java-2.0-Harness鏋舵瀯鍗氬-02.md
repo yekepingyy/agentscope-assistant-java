@@ -1,10 +1,25 @@
 # 小深：用 AgentScope Java 2.0 Harness 做私人助手（下）
 
-> 本篇是系列 **下篇**：工具、智谱 MCP/REST 联网、对话 SSE 与审批续跑、DTO、配置与前端、设计取舍。  
-> 上篇：[小深-AgentScope-Java-2.0-Harness架构博客-01.md](./小深-AgentScope-Java-2.0-Harness架构博客-01.md)（架构总览、装配层、Redis、记忆隔离）  
-> 项目：`agentscope-assistant-java` · 技术栈：**Spring Boot 3.2.5 + AgentScope Java 2.0.1 `HarnessAgent` + MCP SDK 0.17.0**
->
-> 生产只走 Redis，没有 `distributed` profile。前端是自定义深色页。日志带 `SESSION_ID`、不带 userId。
+> 本篇是系列 **下篇**：工具、官方 tools.json MCP、对话 SSE 与审批续跑、DTO、配置与前端、设计取舍。  
+> 上篇：[小深-AgentScope-Java-2.0-Harness架构博客-01.md](./小深-AgentScope-Java-2.0-Harness架构博客-01.md)  
+> 项目目录：`agentscope-assistant-java-2` · 技术栈：**Spring Boot 3.2.5 + AgentScope Java 2.0.1 `HarnessAgent` + MCP SDK 0.17.0**  
+> 包名：`cn.deepassistant` · 端口 **8089**
+
+## 与仓库对齐（2026-09-15）
+
+下文大量「整文件粘贴」来自早期定稿，**学习请打开仓库源码对照**。相对旧稿的关键差异：
+
+| 主题 | 当前仓库 |
+|------|----------|
+| 子 Agent | 官方自动加载 `workspace/subagents/*.md`，Java **不** `.subagents(...)` |
+| research-agent | `isolated` + `maxIters: 25` + ephemeral（不写 MEMORY / 日流水） |
+| SSE | `AssistantChatService.chat/resume` 返回 `Flux<SseEvent>`，订阅 `streamEvents`，**禁止** `toIterable()` |
+| 同会话互斥 | `RedisSessionRunLock`；忙则 SSE `error`「该会话正在处理中」 |
+| 审批续跑 | `pendingApprovals.claim` 后再带 confirm metadata；抢锁失败会写回审批单 |
+| 配置 | `agent.max-iters: 25`，`llm.model: qwen3.8-max`，`auto-allow-tools: webReader,webSearchPrime` |
+| MCP | `workspace/tools.json` SSE；`build()` 前 `McpServerRegistrar` + 强制 MCP 只读 |
+
+对照：[README](../README.md) · [上篇](./小深-AgentScope-Java-2.0-Harness架构博客-01.md) · [测试用例](./test-cases.md)
 
 Java 源码为便于发布已**省略 `import` 行**，落盘后请对照仓库或用 IDE 补全。
 
@@ -23,9 +38,22 @@ Java 源码为便于发布已**省略 `import` 行**，落盘后请对照仓库�
 ```java
 package cn.deepassistant.tool;
 
+/**
+ * 注册进 Harness {@code Toolkit} 的通用工具。HTTP 接口不会直接调这些方法。
+ *
+ * <p><b>何时调用（框架）：</b>大模型在 ReAct 循环里决定用某个工具后，
+ * {@code io.agentscope.core.tool.ToolExecutor#callTool} 按工具名找到
+ * {@code ReflectiveFunctionTool}，再反射调用下面带 {@code @Tool} 的方法。
+ * 只在 {@code harnessAgent.streamEvents} 进行中发生。
+ */
 @Component
 public class CommonTools {
 
+    /**
+     * 返回本机当前日期时间（中文星期）。
+     *
+     * <p><b>何时调用（框架）：</b>模型认为需要「现在几点/今天星期几」时发出 {@code getCurrentDateTime} 工具调用。
+     */
     @Tool(name = "getCurrentDateTime", description = "获取当前精确日期、时间与星期。",
             readOnly = true, concurrencySafe = true)
     public String getCurrentDateTime() {
@@ -34,6 +62,11 @@ public class CommonTools {
         return now.format(DateTimeFormatter.ofPattern("yyyy年MM月dd日 HH:mm:ss")) + "，" + weekday;
     }
 
+    /**
+     * 安全求值四则运算（无 ScriptEngine）。
+     *
+     * <p><b>何时调用（框架）：</b>模型发出 {@code calculate}，参数 {@code expression} 由框架从 ToolUseBlock 填入。
+     */
     @Tool(name = "calculate", description = "计算数学表达式，支持加减乘除与括号。",
             readOnly = true, concurrencySafe = true)
     public String calculate(
@@ -48,41 +81,13 @@ public class CommonTools {
 }
 ```
 
-### `src/main/java/cn/deepassistant/tool/WebResearchTools.java`
+### 联网：`workspace/tools.json`（官方 MCP）
 
-**作用：** webSearch / webRead，具体协议走 WebSearchService
+**作用：** 工作区根目录 `tools.json` 声明 `mcpServers` + `deny`。`getenv` 已有 `MCP_API_KEY` 时，Harness `build()` 走官方 `ToolsConfigLoader`（远端 overlay 上层 + 本地模板下层）。JDK 17 往往写不进 getenv，此时用 yml `mcp.api-key` 做与官方相同的占位符替换再 `builder.toolsConfig()`。不要 `disableToolsConfig()`，也不要用 `allow` 白名单（会把 `read_file` / `agent_spawn` 砍掉）。
 
-```java
-package cn.deepassistant.tool;
+智谱 `/mcp` 是 Streamable HTTP，只接受 POST。Java MCP SDK 0.17 初始化后还会 GET SSE，智谱返回 405（`Session not found`）。因此按[智谱文档](https://docs.bigmodel.cn/cn/coding-plan/mcp/search-mcp-server)给旧客户端的配置走 `/sse?Authorization=`。模型看到的工具名仍是 MCP 原名：`webSearchPrime`、`webReader`（2.0.1 不自动加 `mcp__` 前缀）。密钥必须是智谱 API Key，不要用百炼 Key。
 
-@Component
-public class WebResearchTools {
-
-    private final WebSearchService webSearchService;
-
-    public WebResearchTools(WebSearchService webSearchService) {
-        this.webSearchService = webSearchService;
-    }
-
-    @Tool(name = "webSearch",
-            description = "联网搜索最新信息。适合新闻、政策、事实核查、多角度调研。",
-            readOnly = true, concurrencySafe = true)
-    public String webSearch(
-            @ToolParam(name = "query", description = "搜索关键词或问题，尽量具体")
-            String query) {
-        return webSearchService.search(query);
-    }
-
-    @Tool(name = "webRead",
-            description = "读取指定 URL 的网页正文（需启用 mcp.zhipu.enabled=true 并配置 web-reader-url）。",
-            readOnly = true, concurrencySafe = true)
-    public String webRead(
-            @ToolParam(name = "url", description = "网页 URL")
-            String url) {
-        return webSearchService.readUrl(url);
-    }
-}
-```
+完整 JSON 见下文 `workspace/tools.json`。
 
 ### `src/main/java/cn/deepassistant/tool/HistoryMemoryTools.java`
 
@@ -104,7 +109,11 @@ package cn.deepassistant.tool;
  * </ul>
  *
  * 网页上用户看到的对话存在 Redis {@code as:web:{userId}:{sessionId}}，和 jsonl 不是同一份。
- * 这个工具专门搜那份 JSON，回答「我在这个聊天页里上次说过什么」。
+ * 这个工具专门搜那份会话 JSON，回答「我在这个聊天页里上次说过什么」。
+ *
+ * <p><b>何时调用（框架）：</b>{@code Toolkit.registerTool(historyMemoryTools)} 之后，
+ * 模型在对话中点名 {@code search_conversation_history} / {@code get_user_usage}，
+ * {@code ToolExecutor} 反射进来。第一个参数 {@link RuntimeContext} 由框架注入，不是模型填的。
  */
 @Component
 public class HistoryMemoryTools {
@@ -117,6 +126,12 @@ public class HistoryMemoryTools {
         this.memoryCatalog = memoryCatalog;
     }
 
+    /**
+     * 搜网页会话库原文。
+     *
+     * <p><b>何时调用（框架）：</b>模型发出 {@code search_conversation_history}。
+     * 档案页搜索走 HTTP {@code GET /api/history/search}，不走这个方法（那条走 {@code UserMemoryQueryService}）。
+     */
     @Tool(name = "search_conversation_history",
             description = "在网页会话库（用户在界面里看到的那些对话）里按关键词搜原文。"
                     + "搜跨会话沉淀事实请用官方 memory_search；搜压缩前卸载日志请用 session_search。",
@@ -144,6 +159,12 @@ public class HistoryMemoryTools {
         return sb.toString();
     }
 
+    /**
+     * 当前用户用量 + MEMORY.md 摘要。
+     *
+     * <p><b>何时调用（框架）：</b>模型发出 {@code get_user_usage}。
+     * 档案页 {@code GET /api/memory} 不走这个方法。
+     */
     @Tool(name = "get_user_usage",
             description = "查看当前用户的使用概况（会话数、消息数）以及当前 MEMORY.md / 日流水摘要。",
             readOnly = true, concurrencySafe = true)
@@ -179,18 +200,36 @@ public class HistoryMemoryTools {
 ```java
 package cn.deepassistant.util;
 
+/**
+ * 只支持 {@code + - * / ()} 和小数的表达式求值，给 {@code calculate} 工具用。
+ * 不用 {@code ScriptEngine} / 反射，避免模型把任意 Java 表达式塞进来。
+ *
+ * <p>文法：expression → term {(+|-) term}*；term → factor {(*|/) factor}*；
+ * factor → +factor | -factor | (expression) | number。
+ */
 public final class SafeMathEval {
 
     private SafeMathEval() {
     }
 
+    /**
+     * 求值成 double。空白抛错；除以零在 {@link Parser#parseTerm()} 里单独拦。
+     *
+     * <p><b>何时调用：</b>{@link #evalToString}；单测。框架不直接调。
+     */
     public static double eval(String expression) {
         if (expression == null || expression.isBlank()) {
             throw new IllegalArgumentException("表达式为空");
         }
+        // 去掉空白后再解析，"( 1 + 2 )" 和 "(1+2)" 等价
         return new Parser(expression.replaceAll("\\s+", "")).parse();
     }
 
+    /**
+     * 给人看的结果字符串：能表示成整数就去掉小数点；NaN / Inf 当成非法（例如 0/0）。
+     *
+     * <p><b>何时调用（框架间接）：</b>{@code CommonTools.calculate} ← {@code ToolExecutor}。
+     */
     public static String evalToString(String expression) {
         double v = eval(expression);
         if (Double.isNaN(v) || Double.isInfinite(v)) {
@@ -202,9 +241,12 @@ public final class SafeMathEval {
         return String.valueOf(v);
     }
 
+    /** 递归下降解析器，一次扫完整个去掉空白的表达式。 */
     private static final class Parser {
         private final String s;
+        /** 当前字符下标；{@link #next()} 会先 ++ 再读。 */
         private int pos = -1;
+        /** 当前字符的码点；扫完后为 -1。 */
         private int ch;
 
         Parser(String s) {
@@ -215,6 +257,7 @@ public final class SafeMathEval {
             ch = (++pos < s.length()) ? s.charAt(pos) : -1;
         }
 
+        /** 若当前字符是 c 则吃掉并返回 true。 */
         boolean eat(int c) {
             if (ch == c) {
                 next();
@@ -232,6 +275,7 @@ public final class SafeMathEval {
             return x;
         }
 
+        /** 加减，优先级最低。 */
         double parseExpression() {
             double x = parseTerm();
             for (; ; ) {
@@ -245,6 +289,7 @@ public final class SafeMathEval {
             }
         }
 
+        /** 乘除。除数为 0 立刻抛，不让 Inf 漏到外层才发现。 */
         double parseTerm() {
             double x = parseFactor();
             for (; ; ) {
@@ -262,6 +307,7 @@ public final class SafeMathEval {
             }
         }
 
+        /** 一元正负、括号、字面量数字。不支持函数名，遇到字母直接失败。 */
         double parseFactor() {
             if (eat('+')) {
                 return parseFactor();
@@ -290,737 +336,478 @@ public final class SafeMathEval {
 }
 ```
 
-## 六、联网集成（MCP / REST）
+### `src/main/java/cn/deepassistant/util/ProcessEnv.java`
 
-### `src/main/java/cn/deepassistant/integration/mcp/WebSearchService.java`
+**作用：** 尽量把 yml `mcp.api-key` 写进 `System.getenv`。官方 `ToolsConfigLoader` 的 `${MCP_API_KEY}` 只认进程环境。JDK 17 默认打不开 `java.lang.ProcessEnvironment`，失败时打 warn，由 `WorkspaceToolsConfigs.load` 做同等替换。已有非空 env 不覆盖。不要用百炼 `LLM_API_KEY` 去调智谱 MCP。
 
-**作用：** 搜索后端接口，MCP 与 REST 二选一
-
-```java
-package cn.deepassistant.integration.mcp;
-
-public interface WebSearchService {
-
-    String search(String query);
-
-    default String readUrl(String url) {
-        return "当前未启用网页读取能力: " + url;
-    }
-}
-```
-
-### `src/main/java/cn/deepassistant/integration/mcp/McpToolSupport.java`
-
-**作用：** MCP Java SDK 0.17：按 inputSchema 选参、CallToolResult 收成文本
+Harness 2.0.1 会先快照子 Agent Toolkit，再注册 MCP；`research-agent` 又是 isolated 工作区（没有 `tools.json`）。所以父 `build()` 前必须 `McpServerRegistrar.register`，再 `toolsConfig()` 只注入 deny。
 
 ```java
-package cn.deepassistant.integration.mcp;
+package cn.deepassistant.util;
 
 /**
- * MCP Java SDK 0.17+ {@link McpSchema} 适配：从工具 inputSchema 选参数名，并把
- * {@link McpSchema.CallToolResult}（content + Object structuredContent）收成文本。
+ * 把键写入 {@link System#getenv()}。Harness {@code tools.json} 的 {@code ${ENV}} 只认进程环境变量，
+ * 不认 Spring {@code application.yml}。
+ *
+ * <p>JDK 17 默认不允许打开 {@code java.lang.ProcessEnvironment}，写入会失败；调用方必须再走
+ * 本地 {@code tools.json} 替换（与 {@code ToolsConfigLoader.substituteEnv} 等价）。
  */
-final class McpToolSupport {
+@Slf4j
+public final class ProcessEnv {
 
-    private McpToolSupport() {
-    }
-
-    static String toolName(McpSchema.Tool tool) {
-        return tool == null ? "" : nullToEmpty(tool.name());
-    }
-
-    static boolean matchesTool(McpSchema.Tool tool, String... tokens) {
-        if (tool == null) {
-            return false;
-        }
-        String haystack = (nullToEmpty(tool.name()) + " " + nullToEmpty(tool.title())
-                + " " + nullToEmpty(tool.description())).toLowerCase(Locale.ROOT);
-        for (String token : tokens) {
-            if (token != null && haystack.contains(token.toLowerCase(Locale.ROOT))) {
-                return true;
-            }
-        }
-        return false;
+    private ProcessEnv() {
     }
 
     /**
-     * 按 0.17 {@link McpSchema.JsonSchema} 的 required / properties 选调用参数名。
-     * 先用 schema 里真实存在的首选名，没有再退回 required，再退回 properties。
+     * 环境里已有非空值则保持不动。否则尝试写入 {@code value}。
+     *
+     * @return 调用结束后 {@code System.getenv(key)} 非空
      */
-    static List<String> argumentKeys(McpSchema.JsonSchema schema, List<String> preferred) {
-        List<String> properties = schema == null || schema.properties() == null
-                ? List.of()
-                : List.copyOf(schema.properties().keySet());
-        List<String> required = schema == null || schema.required() == null
-                ? List.of()
-                : List.copyOf(schema.required());
-        Set<String> known = new LinkedHashSet<>();
-        known.addAll(required);
-        known.addAll(properties);
-        if (preferred != null) {
-            List<String> matched = new ArrayList<>();
-            for (String want : preferred) {
-                String actual = findIgnoreCase(known, want);
-                if (actual != null && !matched.contains(actual)) {
-                    matched.add(actual);
-                }
-            }
-            if (!matched.isEmpty()) {
-                return matched;
-            }
+    public static boolean ensure(String key, String value) {
+        if (key == null || key.isBlank()) {
+            return false;
         }
-        if (!required.isEmpty()) {
-            return required;
+        String existing = System.getenv(key);
+        if (existing != null && !existing.isBlank()) {
+            return true;
         }
-        return new ArrayList<>(properties);
-    }
-
-    static String stringify(McpSchema.CallToolResult result) {
-        if (result == null) {
-            return "";
+        if (value == null || value.isBlank()) {
+            return false;
         }
-        List<String> parts = new ArrayList<>();
-        if (result.content() != null) {
-            for (McpSchema.Content content : result.content()) {
-                if (content instanceof McpSchema.TextContent text
-                        && text.text() != null
-                        && !text.text().isBlank()) {
-                    parts.add(text.text());
-                }
-            }
-        }
-        if (parts.isEmpty() && result.structuredContent() != null) {
-            parts.add(stringifyStructured(result.structuredContent()));
-        }
-        return String.join("\n", parts);
-    }
-
-    private static String stringifyStructured(Object structured) {
-        if (structured instanceof Map<?, ?> map) {
-            return map.entrySet().stream()
-                    .map(e -> e.getKey() + ": " + e.getValue())
-                    .collect(Collectors.joining("\n"));
-        }
-        if (structured instanceof List<?> list) {
-            return list.stream().map(String::valueOf).collect(Collectors.joining("\n"));
-        }
-        return String.valueOf(structured);
-    }
-
-    private static String findIgnoreCase(Set<String> known, String want) {
-        if (want == null) {
-            return null;
-        }
-        for (String key : known) {
-            if (key != null && key.equalsIgnoreCase(want)) {
-                return key;
-            }
-        }
-        return null;
-    }
-
-    private static String nullToEmpty(String value) {
-        return value == null ? "" : value;
-    }
-}
-```
-
-### `src/main/java/cn/deepassistant/integration/mcp/ZhipuMcpWebSearchService.java`
-
-**作用：** 智谱 Streamable HTTP MCP；默认启用
-
-```java
-package cn.deepassistant.integration.mcp;
-
-@Slf4j
-@Service
-// MCP SDK 已升到 0.17.0，与 agentscope 的 json-schema-validator 2.0.0 兼容。
-// 缺省启用智谱 MCP；设 mcp.zhipu.enabled=false 回退 REST。
-@ConditionalOnProperty(name = "mcp.zhipu.enabled", havingValue = "true", matchIfMissing = true)
-public class ZhipuMcpWebSearchService implements WebSearchService {
-
-    private static final List<String> SEARCH_ARG_PREFERENCES = List.of("query", "search_query", "q");
-    private static final List<String> READER_ARG_PREFERENCES = List.of("url", "link", "uri");
-
-    @Value("${mcp.zhipu.web-search-url}")
-    private String searchUrl;
-    @Value("${mcp.zhipu.web-reader-url:}")
-    private String readerUrl;
-    @Value("${mcp.zhipu.api-key:}")
-    private String apiKey;
-
-    private McpClientWrapper searchClient;
-    private McpClientWrapper readerClient;
-    private String searchToolName = "webSearchPrime";
-    private String readerToolName = "webReader";
-    private List<String> searchArgKeys = SEARCH_ARG_PREFERENCES;
-    private List<String> readerArgKeys = READER_ARG_PREFERENCES;
-
-    @PostConstruct
-    public void init() {
-        this.searchClient = tryBuildClient("zhipu-web-search", resolveUrl(searchUrl), true);
-        if (readerUrl != null && !readerUrl.isBlank()) {
-            this.readerClient = tryBuildClient("zhipu-web-reader", resolveUrl(readerUrl), false);
-        }
-        log.info("[MCP] 智谱 Web Search searchTool={} readerTool={} readerEnabled={} searchReady={}",
-                searchToolName, readerToolName, readerClient != null, searchClient != null);
-    }
-
-    private McpClientWrapper tryBuildClient(String name, String url, boolean search) {
         try {
-            McpClientWrapper client = buildClient(name, url);
-            resolveTool(client, search);
-            return client;
+            put(key, value);
         } catch (Exception e) {
-            log.warn("[MCP] 初始化 {} 失败，该能力暂不可用: {}", name, e.getMessage());
-            return null;
+            log.warn("无法写入 System.getenv({})：{}。请在 IDE 环境变量或 shell 里 export，或依赖 yml 回退替换。",
+                    key, e.toString());
+            return false;
         }
+        String now = System.getenv(key);
+        return now != null && !now.isBlank();
     }
 
-    private McpClientWrapper buildClient(String name, String url) {
-        McpClientBuilder builder = McpClientBuilder.create(name)
-                .streamableHttpTransport(url)
-                .timeout(Duration.ofSeconds(60));
-        if (!urlContainsAuth(url) && apiKey != null && !apiKey.isBlank()) {
-            builder.header("Authorization", "Bearer " + apiKey);
-        }
-        McpClientWrapper client = builder.buildSync();
-        client.initialize().block(Duration.ofSeconds(30));
-        return client;
-    }
-
-    private String resolveUrl(String raw) {
-        if (raw == null || raw.isBlank()) {
-            return raw;
-        }
-        if (urlContainsAuth(raw) || apiKey == null || apiKey.isBlank()) {
-            return raw;
-        }
-        if (raw.contains("mcp-broker") || raw.contains("Authorization=")) {
-            String sep = raw.contains("?") ? "&" : "?";
-            return raw + sep + "Authorization=" + apiKey;
-        }
-        return raw;
-    }
-
-    private static boolean urlContainsAuth(String url) {
-        return url != null && url.toLowerCase().contains("authorization=");
-    }
-
-    private void resolveTool(McpClientWrapper client, boolean search) {
+    private static void put(String key, String value) throws Exception {
+        Exception last = null;
         try {
-            List<McpSchema.Tool> tools = client.listTools().block(Duration.ofSeconds(20));
-            if (tools == null || tools.isEmpty()) {
+            mutateProcessEnvironment(key, value);
+            if (notBlank(System.getenv(key))) {
                 return;
             }
-            for (McpSchema.Tool tool : tools) {
-                if (search && McpToolSupport.matchesTool(tool, "search", "webSearchPrime")) {
-                    searchToolName = McpToolSupport.toolName(tool);
-                    List<String> keys = McpToolSupport.argumentKeys(tool.inputSchema(), SEARCH_ARG_PREFERENCES);
-                    if (!keys.isEmpty()) {
-                        searchArgKeys = keys;
-                    }
-                }
-                if (!search && McpToolSupport.matchesTool(tool, "reader", "read", "webReader")) {
-                    readerToolName = McpToolSupport.toolName(tool);
-                    List<String> keys = McpToolSupport.argumentKeys(tool.inputSchema(), READER_ARG_PREFERENCES);
-                    if (!keys.isEmpty()) {
-                        readerArgKeys = keys;
-                    }
-                }
-            }
-            log.info("[MCP] listTools({}): {} argKeys={}",
-                    search ? "search" : "reader",
-                    tools.stream().map(McpToolSupport::toolName).toList(),
-                    search ? searchArgKeys : readerArgKeys);
         } catch (Exception e) {
-            log.warn("[MCP] listTools 失败，将按默认工具名/参数名调用: {}", e.getMessage());
-        }
-    }
-
-    @Override
-    public String search(String query) {
-        if (query == null || query.isBlank()) {
-            return "搜索词为空";
-        }
-        if (searchClient == null) {
-            return "智谱 MCP 搜索客户端未就绪。请检查 API Key / mcp.zhipu.*，或设置 mcp.zhipu.enabled=false 回退 REST。";
-        }
-        log.info("[MCP] search START query={}", query);
-        long t0 = System.currentTimeMillis();
-        Exception last = null;
-        for (String key : searchArgKeys) {
-            try {
-                Map<String, Object> args = new LinkedHashMap<>();
-                args.put(key, query);
-                String text = call(searchClient, searchToolName, args);
-                log.info("[MCP] search END   tool={} argKey={} elapsedMs={} resultChars={}",
-                        searchToolName, key, System.currentTimeMillis() - t0, text.length());
-                return text;
-            } catch (Exception e) {
-                last = e;
-            }
-        }
-        log.warn("[MCP] search FAIL  elapsedMs={} error={}",
-                System.currentTimeMillis() - t0, last == null ? "unknown" : last.getMessage());
-        return "智谱 MCP 联网搜索失败: " + (last == null ? "unknown" : last.getMessage())
-                + "。请检查 API Key / mcp.zhipu.* 配置，或设置 mcp.zhipu.enabled=false 回退 REST web_search。";
-    }
-
-    @Override
-    public String readUrl(String url) {
-        if (readerClient == null) {
-            return "未配置或未连上 mcp.zhipu.web-reader-url，无法读取网页: " + url;
-        }
-        log.info("[MCP] readUrl START url={}", url);
-        long t0 = System.currentTimeMillis();
-        Exception last = null;
-        for (String key : readerArgKeys) {
-            try {
-                String text = call(readerClient, readerToolName, Map.of(key, url));
-                log.info("[MCP] readUrl END   tool={} argKey={} elapsedMs={} resultChars={}",
-                        readerToolName, key, System.currentTimeMillis() - t0, text.length());
-                return text;
-            } catch (Exception e) {
-                last = e;
-            }
-        }
-        log.warn("[MCP] readUrl FAIL  elapsedMs={} error={}", System.currentTimeMillis() - t0,
-                last == null ? "unknown" : last.getMessage());
-        return "智谱 MCP 网页读取失败: " + (last == null ? "unknown" : last.getMessage());
-    }
-
-    private static String call(McpClientWrapper client, String toolName, Map<String, Object> args) {
-        McpSchema.CallToolResult result = client.callTool(toolName, args).block(Duration.ofSeconds(60));
-        if (result == null) {
-            return "";
-        }
-        if (Boolean.TRUE.equals(result.isError())) {
-            throw new IllegalStateException(McpToolSupport.stringify(result));
-        }
-        return McpToolSupport.stringify(result);
-    }
-
-    @PreDestroy
-    public void destroy() {
-        closeQuietly(searchClient);
-        closeQuietly(readerClient);
-    }
-
-    private static void closeQuietly(McpClientWrapper client) {
-        if (client == null) {
-            return;
+            last = e;
         }
         try {
-            client.close();
-        } catch (Exception ignored) {
-            // 关闭阶段不再向上抛
+            mutateGetenvView(key, value);
+            if (notBlank(System.getenv(key))) {
+                return;
+            }
+        } catch (Exception e) {
+            last = e;
         }
+        if (last != null) {
+            throw last;
+        }
+        throw new IllegalStateException("写入后 System.getenv(" + key + ") 仍为空");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void mutateProcessEnvironment(String key, String value) throws Exception {
+        Class<?> pe = Class.forName("java.lang.ProcessEnvironment");
+        try {
+            Field env = pe.getDeclaredField("theEnvironment");
+            env.setAccessible(true);
+            ((Map<String, String>) env.get(null)).put(key, value);
+        } catch (NoSuchFieldException ignored) {
+            // Windows 只有 case-insensitive 那张表
+        }
+        try {
+            Field ci = pe.getDeclaredField("theCaseInsensitiveEnvironment");
+            ci.setAccessible(true);
+            ((Map<String, String>) ci.get(null)).put(key, value);
+        } catch (NoSuchFieldException ignored) {
+            // Unix
+        }
+        try {
+            Field unmod = pe.getDeclaredField("theUnmodifiableEnvironment");
+            unmod.setAccessible(true);
+            Map<String, String> frozen = (Map<String, String>) unmod.get(null);
+            putInner(frozen, key, value);
+        } catch (NoSuchFieldException ignored) {
+            // 部分 JDK 没有这张表
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void mutateGetenvView(String key, String value) throws Exception {
+        putInner(System.getenv(), key, value);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void putInner(Map<String, String> frozen, String key, String value) throws Exception {
+        Field inner = frozen.getClass().getDeclaredField("m");
+        inner.setAccessible(true);
+        ((Map<String, String>) inner.get(frozen)).put(key, value);
+    }
+
+    private static boolean notBlank(String value) {
+        return value != null && !value.isBlank();
     }
 }
 ```
 
-### `src/main/java/cn/deepassistant/integration/mcp/RestWebSearchService.java`
+## 六、联网集成（官方 tools.json MCP）
 
-**作用：** mcp.zhipu.enabled=false 时直连 LLM web_search
-
-```java
-package cn.deepassistant.integration.mcp;
-
-@Slf4j
-@Service
-// 仅当显式关闭智谱 MCP 时走 REST（直连 LLM web_search）。默认 mcp.zhipu.enabled=true。
-@ConditionalOnProperty(name = "mcp.zhipu.enabled", havingValue = "false")
-public class RestWebSearchService implements WebSearchService {
-
-    @Value("${llm.base-url}")
-    private String baseUrl;
-    @Value("${llm.api-key}")
-    private String apiKey;
-    @Value("${llm.timeout-seconds:120}")
-    private int timeoutSeconds;
-
-    @Autowired
-    private ObjectMapper objectMapper;
-
-    private final HttpClient httpClient = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(20))
-            .build();
-
-    @Override
-    public String search(String query) {
-        if (query == null || query.isBlank()) {
-            return "搜索词为空";
-        }
-        log.info("[REST] search START query={}", query);
-        long t0 = System.currentTimeMillis();
-        try {
-            String url = baseUrl.endsWith("/") ? baseUrl + "web_search" : baseUrl + "/web_search";
-            String body = objectMapper.createObjectNode()
-                    .put("search_query", query)
-                    .put("search_engine", "search_pro")
-                    .put("count", 8)
-                    .put("content_size", "medium")
-                    .toString();
-
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(url))
-                    .timeout(Duration.ofSeconds(timeoutSeconds))
-                    .header("Authorization", "Bearer " + apiKey)
-                    .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(body))
-                    .build();
-
-            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-            if (response.statusCode() >= 400) {
-                log.warn("[REST] search FAIL  http={} elapsedMs={}",
-                        response.statusCode(), System.currentTimeMillis() - t0);
-                return "REST web_search 失败 HTTP " + response.statusCode() + ": " + response.body();
-            }
-            String formatted = format(response.body(), query);
-            log.info("[REST] search END   elapsedMs={} resultChars={}",
-                    System.currentTimeMillis() - t0, formatted.length());
-            return formatted;
-        } catch (Exception e) {
-            log.error("[REST] search FAIL  elapsedMs={}", System.currentTimeMillis() - t0, e);
-            return "联网搜索失败: " + e.getMessage();
-        }
-    }
-
-    @Override
-    public String readUrl(String url) {
-        return "当前为 REST 模式，未启用网页读取。请设置 mcp.zhipu.enabled=true 使用智谱 web_reader MCP。"
-                + " 目标 URL: " + url;
-    }
-
-    private String format(String json, String query) throws Exception {
-        JsonNode root = objectMapper.readTree(json);
-        JsonNode items = root.path("search_result");
-        if (!items.isArray()) {
-            items = root.path("search_results");
-        }
-        if (!items.isArray()) {
-            items = root.path("data");
-        }
-        List<String> lines = new ArrayList<>();
-        lines.add("搜索引擎: rest | 查询: " + query);
-        lines.add("");
-        if (!items.isArray() || items.isEmpty()) {
-            lines.add(json.length() > 2000 ? json.substring(0, 2000) + "…" : json);
-            return String.join("\n", lines);
-        }
-        int i = 1;
-        for (JsonNode item : items) {
-            String title = text(item, "title", "name");
-            String link = text(item, "link", "url");
-            String snippet = text(item, "content", "snippet", "summary", "abstract");
-            String site = text(item, "media", "site_name", "source");
-            lines.add(i + ". " + (title.isBlank() ? "(无标题)" : title));
-            if (!site.isBlank()) {
-                lines.add("   来源: " + site);
-            }
-            if (!link.isBlank()) {
-                lines.add("   链接: " + link);
-            }
-            if (!snippet.isBlank()) {
-                lines.add("   摘要: " + (snippet.length() > 400 ? snippet.substring(0, 400) : snippet));
-            }
-            lines.add("");
-            i++;
-        }
-        return String.join("\n", lines);
-    }
-
-    private static String text(JsonNode node, String... keys) {
-        for (String k : keys) {
-            JsonNode v = node.get(k);
-            if (v != null && !v.isNull() && !v.asText().isBlank()) {
-                return v.asText();
-            }
-        }
-        return "";
-    }
-}
-```
+自研 `ZhipuMcpWebSearchService` / `WebResearchTools` / REST 回退已删除。MCP 由框架 `McpServerRegistrar` 按 `workspace/tools.json` 注册。密钥链路：`export MCP_API_KEY`（官方 getenv）→ 否则 yml `mcp.api-key`（`ProcessEnv.ensure`，失败则本地替换占位符）。**不要**把百炼 Key 当智谱 MCP Key。传输用智谱文档的 SSE 回退，避免 Java SDK 对 `/mcp` GET 405。
 
 ## 七、对话服务与 SSE API
 
 ### `src/main/java/cn/deepassistant/service/AssistantChatService.java`
 
-**作用：** RuntimeContext 跑 Harness；HITL pending 走 Redis `as:pending:`（跨副本）。网页 JSON 走 SessionStore。
+**作用（请读仓库文件，勿复制下文旧粘贴）：** 把用户消息 / 审批续跑交给 `HarnessAgent.streamEvents`，把 `AgentEvent` 映射成网页 SSE。
+
+当前实现要点：
+
+1. **`chat` / `resume` 返回 `Flux<SseEvent>`**，Controller 直接订阅；浏览器断开即取消订阅。
+2. **不要**再写 `stream.toIterable()` + `boundedElastic` 阻塞循环——那是旧版做法。
+3. **`RedisSessionRunLock`**：同一 `(userId, sessionId)` 同时只能跑一轮；冲突返回 SSE error。
+4. **待审批**：`chat` 前若仍有 pending 则拒绝新聊；`resume` 用 **`claim`** 取出审批单，抢锁失败会把审批单写回。
+5. **续跑 metadata**：`Msg.METADATA_CONFIRM_RESULTS` + `METADATA_CONFIRM_REQUEST_REPLY_ID`。
+6. **删会话**：取消进行中的 `Disposable`，再清 pending / SessionStore / AgentState。
+7. 每条官方事件先过 `AgentActivityLogger`；思考 delta 不落库，思考结束可持久化全文。
+
+```java
+// 学习入口（伪代码，完整逻辑见仓库）
+public Flux<SseEvent> chat(String userId, String sessionId, String userMessage) {
+    return Flux.defer(() -> {
+        // getOrCreate 会话 → 若有 pending 则 error
+        // runLock.tryAcquire → 失败则「该会话正在处理中」
+        // appendMessage(user) → subscribe(streamEvents(...))
+    });
+}
+
+public Flux<SseEvent> resume(String userId, String sessionId, boolean approved) {
+    return Flux.defer(() -> {
+        // claim pending → tryAcquire → ConfirmResult metadata → subscribe
+    });
+}
+```
+
+### `src/main/java/cn/deepassistant/service/AgentActivityLogger.java`
+
+**作用：** 一轮对话里模型做了什么：调用模型、思考摘要、工具名/参数、搜索词与返回、作答预览。只打 MDC 的 `SESSION_ID`，不打 userId。过长截断；args 里的 api-key / token 打码。搜索类工具（`webSearchPrime` / `webReader` 等）走 `[Search]` 前缀。
 
 ```java
 package cn.deepassistant.service;
 
 /**
- * 把一次用户消息交给官方 {@link HarnessAgent}，再把事件映射成网页 SSE。
+ * 把一轮 Harness 事件打成可读的后台日志：模型在干什么、调了哪些工具、搜索词和返回摘要。
+ * 只打 {@code SESSION_ID}（MDC），<b>不打 userId</b>。
  *
- * <p>多用户隔离靠 {@code (userId, sessionId)} 二元组：
- * <ul>
- *   <li>{@link RuntimeContext} 带上 userId + sessionId，框架据此寻址 AgentState 槽位和工作区文件</li>
- *   <li>{@link SessionStore} 把网页聊天 JSON 存 Redis，多副本共享</li>
- *   <li>{@link AgentStateStore#delete(String, String)} 也按 (userId, sessionId) 清理</li>
- * </ul>
- *
- * <p>跨会话记忆<b>不用</b>在这里再调一次模型。流式输出结束后，框架的
- * {@code MemoryFlushMiddleware} 会在后台把事实追加到该用户的 {@code memory/YYYY-MM-DD.md}。
+ * <p><b>何时调用：</b>{@code AssistantChatService.run} 每来一条官方 {@link AgentEvent} 就 {@link #accept}，
+ * 流结束再 {@link #finish}。
  */
 @Slf4j
-@Service
-public class AssistantChatService {
+final class AgentActivityLogger {
 
-    private final HarnessAgent harnessAgent;
-    private final SessionStore sessionStore;
-    private final AgentEventMapper eventMapper;
-    private final AgentStateStore agentStateStore;
-    private final RedisPendingApprovalStore pendingApprovals;
+    static final int ARGS_LIMIT = 800;
+    static final int RESULT_LIMIT = 2000;
+    static final int THINKING_LIMIT = 800;
+    static final int REPLY_LIMIT = 400;
 
-    public AssistantChatService(HarnessAgent harnessAgent,
-                                SessionStore sessionStore,
-                                AgentEventMapper eventMapper,
-                                AgentStateStore agentStateStore,
-                                RedisPendingApprovalStore pendingApprovals) {
-        this.harnessAgent = harnessAgent;
-        this.sessionStore = sessionStore;
-        this.eventMapper = eventMapper;
-        this.agentStateStore = agentStateStore;
-        this.pendingApprovals = pendingApprovals;
-    }
+    private static final Pattern SECRET_KEY = Pattern.compile(
+            "(?i)(\"(?:api[-_]?key|token|secret|authorization|password|bearer)\"\\s*:\\s*\")([^\"]*)(\")");
 
-    /**
-     * 推给 Controller 的一条 SSE 载荷。{@code event} 对应前端 switch（token / tool / interrupt / done）。
-     */
-    public record SseEvent(String event, String data) {
-    }
+    private final List<String> steps = new ArrayList<>();
+    private final Map<String, StringBuilder> argsById = new LinkedHashMap<>();
+    private final Map<String, StringBuilder> resultsById = new LinkedHashMap<>();
+    private final Set<String> argsLogged = new HashSet<>();
+    private final StringBuilder thinking = new StringBuilder();
+    private int modelCalls;
 
-    /**
-     * 该会话是否卡在写文件审批。前端打开历史会话时用来决定要不要显示「批准 / 拒绝」。
-     *
-     * <p><b>何时调用：</b>{@code GET /api/sessions/{id}} 填 {@code pendingApproval}；
-     * {@code POST /api/assistant/resume} 入口校验。AgentScope 不调这个方法。
-     */
-    public boolean hasPendingApproval(String userId, String sessionId) {
-        return pendingApprovals.exists(UserIds.normalize(userId), sessionId);
-    }
-
-    /**
-     * 新用户消息：确保会话存在 → 把 user 消息写入网页会话库 → 把消息交给 Harness 流式跑完。
-     *
-     * <p><b>何时调用：</b>仅 {@code POST /api/assistant/chat}。进到 {@link #streamEvents} 之后，
-     * AgentScope 会自己 load/save AgentState、跑工具、Flush 记忆，本方法不再插手。
-     *
-     * @param eventSink 每映射出一条前端事件就回调一次；Controller 再包装成 SSE
-     * @param cancelled 浏览器断开时为 true，{@link #run} 据此提前退出循环
-     * @return 最终助手回复全文（审批中断时返回等待说明）
-     */
-    public String chat(String userId, String sessionId, String userMessage,
-                       Consumer<SseEvent> eventSink, AtomicBoolean cancelled) {
-        String uid = UserIds.normalize(userId);
-        // 没有会话就现场建一条，标题取首句；已有则原样返回
-        var session = sessionStore.getOrCreate(uid, sessionId, userMessage);
-        String id = session.getId();
-        sessionStore.appendMessage(uid, id, ChatMessageRecord.builder()
-                .role("user")
-                .content(userMessage)
-                .timestamp(Instant.now())
-                .build());
-        RuntimeContext ctx = runtimeContext(uid, id);
-        return run(uid, id, streamEvents(new UserMessage(userMessage), ctx), eventSink, cancelled);
-    }
-
-    /**
-     * 把用户对写文件工具的批准 / 拒绝塞进 {@link Msg} 的 metadata，让 Harness 从中断点继续。
-     *
-     * <p><b>何时调用：</b>仅 {@code POST /api/assistant/resume}（前端点批准/拒绝）。
-     *
-     * <p>框架约定：续跑消息必须带 {@link Msg#METADATA_CONFIRM_RESULTS}，值为
-     * {@code List<ConfirmResult>}，每条对应当初 Ask 的一个 {@link ToolUseBlock}。
-     * {@code ReActAgent} 读到这份 metadata 后才会真正执行（或跳过）那个写文件工具。
-     */
-    public String resume(String userId, String sessionId, boolean approved,
-                         Consumer<SseEvent> eventSink, AtomicBoolean cancelled) {
-        String uid = UserIds.normalize(userId);
-        String id = SessionIds.requireValid(sessionId);
-        List<ToolUseBlock> toolCalls = pendingApprovals.get(uid, id);
-        if (toolCalls == null || toolCalls.isEmpty()) {
-            throw new IllegalStateException("当前会话没有待审批的操作: " + uid + "/" + id);
+    void accept(AgentEvent event) {
+        if (event instanceof ModelCallStartEvent) {
+            modelCalls++;
+            log.info("[Agent] 调用模型 #{}", modelCalls);
+            steps.add("模型#" + modelCalls);
+            return;
         }
-        // 同一审批单可能有多个写文件调用，每个都要带上同一份批准结果
-        List<ConfirmResult> confirmResults = toolCalls.stream()
-                .map(t -> new ConfirmResult(approved, t))
-                .toList();
-        Map<String, Object> meta = new HashMap<>();
-        meta.put(Msg.METADATA_CONFIRM_RESULTS, confirmResults);
-        Msg resumeMsg = Msg.builder()
-                .name("user")
-                .role(MsgRole.USER)
-                .textContent(approved ? "approved" : "denied")
-                .metadata(meta)
-                .build();
-        return run(uid, id, streamEvents(resumeMsg, runtimeContext(uid, id)), eventSink, cancelled);
-    }
-
-    /**
-     * 删网页会话 + 待审批 + AgentState。顺序上先清 pending，避免删会话后审批记录残留。
-     *
-     * <p><b>何时调用：</b>{@code DELETE /api/sessions/{id}}。其中 {@code agentStateStore.delete}
-     * 会进到 AgentScope 的 store 接口，清掉框架自己存的推理上下文。
-     */
-    public void clearSessionMemory(String userId, String sessionId) {
-        String uid = UserIds.normalize(userId);
-        String id = SessionIds.requireValid(sessionId);
-        pendingApprovals.remove(uid, id);
-        sessionStore.delete(uid, id);
-        deleteAgentState(uid, id);
-    }
-
-    /**
-     * 阻塞消费 Harness 事件流：映射 → 推 SSE → 拼回复 → 按中断/完成落库。
-     *
-     * <p>{@code toIterable()} 会卡住当前线程直到流结束，所以 Controller 必须把它放到
-     * {@code boundedElastic}，否则会占死 Netty 的 HTTP 线程。
-     *
-     * <p><b>何时调用：</b>{@link #chat} / {@link #resume} 内部。循环里每一条 {@link AgentEvent}
-     * 都是框架推的（token delta、工具起止、写文件 ASK 的 {@code RequireUserConfirmEvent}）。
-     */
-    private String run(String userId, String sessionId, Flux<AgentEvent> stream,
-                       Consumer<SseEvent> eventSink, AtomicBoolean cancelled) {
-        List<Map<String, Object>> toolEvents = new ArrayList<>();
-        StringBuilder reply = new StringBuilder();
-        AtomicBoolean interrupted = new AtomicBoolean(false);
-        RequireUserConfirmEvent confirmEvent = null;
-        try {
-            Iterable<AgentEvent> events = stream.toIterable();
-            for (AgentEvent event : events) {
-                if (cancelled.get()) {
-                    break;
-                }
-                // 先记下原始审批事件，循环结束后才能把 toolCalls 写入 Redis
-                if (event instanceof RequireUserConfirmEvent confirm) {
-                    confirmEvent = confirm;
-                    interrupted.set(true);
-                }
-                AgentEventMapper.MappedEvent mapped = eventMapper.map(event);
-                if (mapped.skipped()) {
-                    // 心跳、内部 delta 空串等前端不关心的事件直接丢掉
-                    continue;
-                }
-                if ("token".equals(mapped.event())) {
-                    reply.append(mapped.data());
-                } else {
-                    // tool / plan / agent / interrupt 进会话 JSON 的 events 数组，刷新后还能回放
-                    toolEvents.add(storedEvent(mapped));
-                }
-                eventSink.accept(new SseEvent(mapped.event(), mapped.data()));
-                if (mapped.interrupt()) {
-                    // 审批事件已经推给前端，后面的流即使还有也不再消费
-                    break;
-                }
+        if (event instanceof ModelCallEndEvent end) {
+            ChatUsage usage = end.getUsage();
+            if (usage != null) {
+                log.info("[Agent] 模型返回 #{} in={} out={} total={} time={}s",
+                        modelCalls,
+                        usage.getInputTokens(),
+                        usage.getOutputTokens(),
+                        usage.getTotalTokens(),
+                        usage.getTime());
+            } else {
+                log.info("[Agent] 模型返回 #{}", modelCalls);
             }
-        } catch (Exception e) {
-            log.error("[AssistantChat] 执行失败 session={}", sessionId, e);
-            throw new RuntimeException(e.getMessage(), e);
+            return;
         }
-        if (cancelled.get()) {
-            // 用户关掉页面：不写助手消息，避免半截回复污染历史
+        if (event instanceof ThinkingBlockStartEvent) {
+            thinking.setLength(0);
+            log.info("[Agent] 开始思考");
+            return;
+        }
+        if (event instanceof ThinkingBlockDeltaEvent delta) {
+            if (delta.getDelta() != null) {
+                thinking.append(delta.getDelta());
+            }
+            return;
+        }
+        if (event instanceof ThinkingBlockEndEvent) {
+            String text = thinking.toString().trim();
+            if (!text.isEmpty()) {
+                log.info("[Agent] 思考内容 {}", clip(text, THINKING_LIMIT));
+                steps.add("思考");
+            }
+            thinking.setLength(0);
+            return;
+        }
+        if (event instanceof ToolCallStartEvent start) {
+            remember(start.getToolCallId(), start.getToolCallName());
+            log.info("[Agent] 准备调用工具 name={} id={}", start.getToolCallName(), start.getToolCallId());
+            return;
+        }
+        if (event instanceof ToolCallDeltaEvent delta) {
+            remember(delta.getToolCallId(), delta.getToolCallName());
+            append(argsById, delta.getToolCallId(), delta.getDelta());
+            return;
+        }
+        if (event instanceof ToolCallEndEvent end) {
+            remember(end.getToolCallId(), end.getToolCallName());
+            logToolArgs(end.getToolCallId(), end.getToolCallName());
+            return;
+        }
+        if (event instanceof ToolResultStartEvent start) {
+            remember(start.getToolCallId(), start.getToolCallName());
+            if (!loggedArgs(start.getToolCallId())) {
+                logToolArgs(start.getToolCallId(), start.getToolCallName());
+            }
+            log.info("[Agent] 工具执行中 name={} id={}", start.getToolCallName(), start.getToolCallId());
+            return;
+        }
+        if (event instanceof ToolResultTextDeltaEvent delta) {
+            remember(delta.getToolCallId(), delta.getToolCallName());
+            append(resultsById, delta.getToolCallId(), delta.getDelta());
+            return;
+        }
+        if (event instanceof ToolResultEndEvent end) {
+            remember(end.getToolCallId(), end.getToolCallName());
+            logToolResult(end);
+            return;
+        }
+        if (event instanceof RequireUserConfirmEvent confirm) {
+            ToolUseBlock first = confirm.getToolCalls() == null || confirm.getToolCalls().isEmpty()
+                    ? null : confirm.getToolCalls().get(0);
+            String name = first == null ? "未知工具" : first.getName();
+            String args = first == null || first.getInput() == null ? "" : String.valueOf(first.getInput());
+            log.info("[Agent] 等待审批 name={} args={}", name, clip(redact(args), ARGS_LIMIT));
+            steps.add("审批:" + name);
+            return;
+        }
+        if (event instanceof TextBlockStartEvent) {
+            log.info("[Agent] 开始作答");
+        }
+    }
+
+    void finish(String reply, boolean interrupted, boolean cancelled) {
+        if (cancelled) {
+            log.info("[Agent] 本轮被取消 steps={}", steps);
+            return;
+        }
+        if (interrupted) {
+            log.info("[Agent] 本轮停在审批 steps={}", steps);
+            return;
+        }
+        if (reply != null && !reply.isBlank()) {
+            log.info("[Agent] 作答 {}", clip(reply, REPLY_LIMIT));
+            steps.add("作答" + reply.length() + "字");
+        }
+        log.info("[Agent] 本轮结束 steps={}", steps.isEmpty() ? List.of("直接作答") : steps);
+    }
+
+    private void logToolArgs(String id, String name) {
+        String args = buf(argsById, id);
+        String query = searchQuery(name, args);
+        if (isSearch(name) && query != null) {
+            log.info("[Search] 检索词 tool={} query={}", name, clip(query, ARGS_LIMIT));
+            steps.add(name + "(" + clip(query, 80) + ")");
+        } else {
+            log.info("[Agent] 工具参数 name={} id={} args={}", name, id, clip(redact(args), ARGS_LIMIT));
+            steps.add(name);
+        }
+        if (id != null) {
+            argsLogged.add(id);
+        }
+    }
+
+    private boolean loggedArgs(String id) {
+        return id != null && argsLogged.contains(id);
+    }
+
+    private void logToolResult(ToolResultEndEvent end) {
+        String id = end.getToolCallId();
+        String name = end.getToolCallName();
+        String state = end.getState() == null ? "?" : end.getState().name();
+        String result = buf(resultsById, id);
+        if (isSearch(name)) {
+            log.info("[Search] 检索结果 tool={} state={} content={}",
+                    name, state, clip(result, RESULT_LIMIT));
+        } else {
+            log.info("[Agent] 工具结果 name={} id={} state={} content={}",
+                    name, id, state, clip(redact(result), RESULT_LIMIT));
+        }
+        if (id != null) {
+            resultsById.remove(id);
+        }
+    }
+
+    private void remember(String id, String name) {
+        if (id == null) {
+            return;
+        }
+        argsById.computeIfAbsent(id, k -> new StringBuilder());
+        resultsById.computeIfAbsent(id, k -> new StringBuilder());
+    }
+
+    private static void append(Map<String, StringBuilder> buf, String id, String delta) {
+        if (id == null || delta == null || delta.isEmpty()) {
+            return;
+        }
+        buf.computeIfAbsent(id, k -> new StringBuilder()).append(delta);
+    }
+
+    private static String buf(Map<String, StringBuilder> map, String id) {
+        if (id == null) {
             return "";
         }
-        if (interrupted.get() && confirmEvent != null) {
-            pendingApprovals.put(userId, sessionId, confirmEvent.getToolCalls());
-            String note = "⏸ 等待人工审批："
-                    + (confirmEvent.getToolCalls().isEmpty()
-                    ? "未知工具"
-                    : confirmEvent.getToolCalls().get(0).getName())
-                    + "（请在前端批准或拒绝后继续）";
-            sessionStore.appendMessage(userId, sessionId, ChatMessageRecord.builder()
-                    .role("assistant")
-                    .content(note)
-                    .timestamp(Instant.now())
-                    .events(new ArrayList<>(toolEvents))
-                    .build());
-            return note;
+        StringBuilder b = map.get(id);
+        return b == null ? "" : b.toString();
+    }
+
+    static boolean isSearch(String tool) {
+        if (tool == null) {
+            return false;
         }
-        // 正常结束或拒绝后续跑完：清掉可能残留的 pending，把完整回复写入网页会话
-        pendingApprovals.remove(userId, sessionId);
-        String finalReply = reply.toString();
-        sessionStore.appendMessage(userId, sessionId, ChatMessageRecord.builder()
-                .role("assistant")
-                .content(finalReply)
-                .timestamp(Instant.now())
-                .events(new ArrayList<>(toolEvents))
-                .build());
-        return finalReply;
+        String n = tool.toLowerCase(Locale.ROOT);
+        return n.contains("search") || n.contains("webreader") || n.contains("web_fetch") || n.contains("webread");
     }
 
-    /**
-     * 把一条用户消息（或续跑确认消息）交给 Harness，拿回官方事件流。
-     *
-     * <p><b>何时调用：</b>{@link #chat} / {@link #resume}。这是本项目进入 AgentScope 的唯一入口。
-     * 进去之后框架会：load AgentState → 拼 system prompt（含 MEMORY.md）→ 调大模型 →
-     * {@code ToolExecutor} 反射执行 {@code @Tool} 方法 → 需要 ASK 时发 {@code RequireUserConfirmEvent}
-     * → 结束后 {@code MemoryFlushMiddleware} 后台抽日流水。
-     */
-    private Flux<AgentEvent> streamEvents(Msg msg, RuntimeContext ctx) {
-        return harnessAgent.streamEvents(List.of(msg), ctx);
-    }
-
-    /**
-     * 构建 {@link RuntimeContext}，带上 userId + sessionId。
-     * 框架据此寻址 AgentState 槽位、工作区文件命名空间（IsolationScope.USER）。
-     *
-     * <p><b>何时调用：</b>{@link #chat}/{@link #resume} 调 {@code streamEvents} 之前。
-     * 这是本项目把「当前用户/会话」交给 AgentScope 的唯一方式。
-     */
-    private RuntimeContext runtimeContext(String userId, String sessionId) {
-        return RuntimeContext.builder()
-                .userId(userId)
-                .sessionId(sessionId)
-                .build();
-    }
-
-    /**
-     * 把映射后的非 token 事件压成可 JSON 序列化的 Map，存进 {@link ChatMessageRecord#getEvents()}。
-     * plan 事件额外抄一份 {@code todos}，方便前端任务列表直接读。
-     */
-    private Map<String, Object> storedEvent(AgentEventMapper.MappedEvent mapped) {
-        Map<String, Object> stored = new HashMap<>();
-        stored.put("type", mapped.event());
-        stored.put("data", mapped.data());
-        if ("plan".equals(mapped.event())) {
-            stored.put("todos", mapped.data());
+    static String searchQuery(String tool, String argsJson) {
+        if (argsJson == null || argsJson.isBlank()) {
+            return null;
         }
-        return stored;
-    }
-
-    /**
-     * 尽力删 Redis 里该会话的 AgentState。失败只打 warn：网页会话已经删了，残留 state 不会再被打开。
-     */
-    private void deleteAgentState(String userId, String sessionId) {
-        try {
-            agentStateStore.delete(userId, sessionId);
-        } catch (Exception e) {
-            log.warn("[AssistantChat] 清理 agent state 失败 session={}: {}",
-                    sessionId, e.getMessage());
+        for (String key : List.of("q", "query", "search_query", "searchQuery", "keyword", "keywords", "url")) {
+            String value = jsonField(argsJson, key);
+            if (value != null && !value.isBlank()) {
+                return value;
+            }
         }
+        return isSearch(tool) ? argsJson : null;
     }
 
+    static String jsonField(String json, String key) {
+        String needle = "\"" + key + "\"";
+        int i = json.indexOf(needle);
+        if (i < 0) {
+            return null;
+        }
+        int colon = json.indexOf(':', i + needle.length());
+        if (colon < 0) {
+            return null;
+        }
+        int p = colon + 1;
+        while (p < json.length() && Character.isWhitespace(json.charAt(p))) {
+            p++;
+        }
+        if (p >= json.length() || json.charAt(p) != '"') {
+            return null;
+        }
+        StringBuilder out = new StringBuilder();
+        boolean esc = false;
+        for (int j = p + 1; j < json.length(); j++) {
+            char c = json.charAt(j);
+            if (esc) {
+                out.append(c);
+                esc = false;
+                continue;
+            }
+            if (c == '\\') {
+                esc = true;
+                continue;
+            }
+            if (c == '"') {
+                return out.toString();
+            }
+            out.append(c);
+        }
+        return out.toString();
+    }
+
+    static String redact(String text) {
+        if (text == null || text.isEmpty()) {
+            return "";
+        }
+        return SECRET_KEY.matcher(text).replaceAll("$1***$3");
+    }
+
+    static String clip(String text, int max) {
+        if (text == null) {
+            return "";
+        }
+        String flat = text.replace('\n', ' ').replace('\r', ' ').trim();
+        if (flat.length() <= max) {
+            return flat;
+        }
+        return flat.substring(0, max) + "...(" + flat.length() + "字)";
+    }
 }
 ```
 
 ### `src/main/java/cn/deepassistant/service/AgentEventMapper.java`
 
-**作用：** 官方 AgentEvent → 前端 SSE：token / tool / plan / agent / interrupt
+**作用：** 官方 AgentEvent → 前端 SSE：`status` / `thinking` / `token` / `tool` / `plan` / `agent` / `interrupt`。`ModelCallStart` 变 live `status`（思考中）；`ThinkingBlock*` 变 `thinking`；工具起止带 name/id/phase。思考 delta 与 status 不 persist。
 
 ```java
 package cn.deepassistant.service;
 
+/**
+ * 把 AgentScope 官方 {@link AgentEvent} 收成前端 SSE 认识的几种名字：
+ * {@code token} / {@code thinking} / {@code status} / {@code tool} / {@code plan} /
+ * {@code agent} / {@code interrupt}。
+ *
+ * <p><b>何时调用：</b>仅本项目 {@code AssistantChatService.run} 在消费
+ * {@code harnessAgent.streamEvents} 时逐条映射。框架自己不会调这个类。
+ */
 @Component
 @RequiredArgsConstructor
 public class AgentEventMapper {
 
     private final ObjectMapper objectMapper;
 
+    /**
+     * 一条官方事件 → 一条前端事件；不关心的类型返回 {@link MappedEvent#none()} 被丢掉。
+     *
+     * <p><b>何时调用：</b>{@code AssistantChatService.run} 的 for 循环，每个 {@link AgentEvent} 一次。
+     */
     public MappedEvent map(AgentEvent event) {
+        if (event instanceof ModelCallStartEvent) {
+            return MappedEvent.live("status", json(status("thinking", "start")));
+        }
+        if (event instanceof ThinkingBlockStartEvent) {
+            return MappedEvent.live("thinking", json(thinking("start", null)));
+        }
+        if (event instanceof ThinkingBlockDeltaEvent delta) {
+            String text = delta.getDelta();
+            if (text == null || text.isEmpty()) {
+                return MappedEvent.none();
+            }
+            return MappedEvent.live("thinking", json(thinking("delta", text)));
+        }
+        if (event instanceof ThinkingBlockEndEvent) {
+            return MappedEvent.of("thinking", json(thinking("end", null)));
+        }
         if (event instanceof TextBlockDeltaEvent delta) {
             String text = delta.getDelta();
             if (text == null || text.isEmpty()) {
@@ -1038,12 +825,17 @@ public class AgentEventMapper {
             return MappedEvent.of("interrupt", toJson(payload), true);
         }
         if (event instanceof ToolCallStartEvent start) {
-            String name = start.getToolCallName();
-            Map<String, Object> payload = new LinkedHashMap<>();
-            payload.put("type", "tool");
-            payload.put("tool", name);
-            payload.put("phase", "start");
-            return MappedEvent.of(classify(name), toJson(payload));
+            return MappedEvent.of(classify(start.getToolCallName()),
+                    json(toolPayload(start.getToolCallId(), start.getToolCallName(), "start", null)));
+        }
+        if (event instanceof ToolResultStartEvent start) {
+            return MappedEvent.of(classify(start.getToolCallName()),
+                    json(toolPayload(start.getToolCallId(), start.getToolCallName(), "running", null)));
+        }
+        if (event instanceof ToolResultEndEvent end) {
+            String state = end.getState() == null ? null : end.getState().name();
+            return MappedEvent.of(classify(end.getToolCallName()),
+                    json(toolPayload(end.getToolCallId(), end.getToolCallName(), "end", state)));
         }
         String typeName = event.getType() == null ? "" : event.getType().name();
         if (typeName.contains("TOOL") && (typeName.contains("RESULT") || typeName.contains("END"))) {
@@ -1062,7 +854,12 @@ public class AgentEventMapper {
         return MappedEvent.none();
     }
 
-    private static String classify(String toolName) {
+    /**
+     * 按工具名把 start 事件分到前端频道：todo → plan，spawn/task → agent，其余 → tool。
+     *
+     * <p><b>何时调用：</b>仅 {@link #map} 处理工具生命周期事件时。
+     */
+    static String classify(String toolName) {
         if (toolName == null) {
             return "tool";
         }
@@ -1076,6 +873,39 @@ public class AgentEventMapper {
         return "tool";
     }
 
+    private static Map<String, Object> status(String label, String phase) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("label", label);
+        payload.put("phase", phase);
+        return payload;
+    }
+
+    private static Map<String, Object> thinking(String phase, String text) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("phase", phase);
+        if (text != null) {
+            payload.put("text", text);
+        }
+        return payload;
+    }
+
+    private static Map<String, Object> toolPayload(String id, String name, String phase, String state) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("type", "tool");
+        payload.put("id", id);
+        payload.put("tool", name);
+        payload.put("phase", phase);
+        if (state != null) {
+            payload.put("state", state);
+        }
+        return payload;
+    }
+
+    private String json(Map<String, Object> payload) {
+        return toJson(payload);
+    }
+
+    /** JSON 失败时退回 {@code String.valueOf}，避免映射抛错把整条 SSE 掐断。 */
     private String toJson(Object value) {
         try {
             return objectMapper.writeValueAsString(value);
@@ -1084,17 +914,26 @@ public class AgentEventMapper {
         }
     }
 
-    public record MappedEvent(String event, String data, boolean interrupt, boolean skipped) {
+    /**
+     * @param interrupt true 时 {@code AssistantChatService.run} 会停止消费后续事件并写入 pending
+     * @param skipped   true 时前端不展示（空 delta、内部心跳等）
+     * @param persist   false 时只推 SSE，不写进网页会话 events（思考 delta / 状态条）
+     */
+    public record MappedEvent(String event, String data, boolean interrupt, boolean skipped, boolean persist) {
         static MappedEvent of(String event, String data) {
-            return new MappedEvent(event, data, false, false);
+            return new MappedEvent(event, data, false, false, true);
         }
 
         static MappedEvent of(String event, String data, boolean interrupt) {
-            return new MappedEvent(event, data, interrupt, false);
+            return new MappedEvent(event, data, interrupt, false, true);
+        }
+
+        static MappedEvent live(String event, String data) {
+            return new MappedEvent(event, data, false, false, false);
         }
 
         static MappedEvent none() {
-            return new MappedEvent(null, null, false, true);
+            return new MappedEvent(null, null, false, true, false);
         }
     }
 }
@@ -1102,7 +941,7 @@ public class AgentEventMapper {
 
 ### `src/main/java/cn/deepassistant/controller/AssistantController.java`
 
-**作用：** HTTP API。聊天 SSE 在 `boundedElastic` 工作线程用 `ConversationMdc.run` 写入 `SESSION_ID`（不写 userId）。GET 会话不存在返回 400。
+**作用：** HTTP API。聊天 / 续跑都是真流式 SSE：先推 `session`，再订阅 Harness Flux。`CACHE_CONTROL` + `X-Accel-Buffering: no` 避免反向代理把 token 攒包。START 日志在本类打开 `SESSION_ID`；事件到达时服务层再打开。GET 会话不存在返回 400。
 
 ```java
 package cn.deepassistant.controller;
@@ -1115,7 +954,8 @@ package cn.deepassistant.controller;
  * 不传时回退到 {@code "local"}，等价于原来的单用户模式。
  *
  * <p>日志里的 {@code SESSION_ID}：聊天 / 续跑的 sessionId 在 JSON body 里，拦截器读不到，
- * 必须在本类里打开 MDC；且 SSE 真正跑在 {@code boundedElastic} 工作线程，要在那条线程再打开一次。
+ * 必须在本类 START 日志里打开 MDC。Harness 每条事件到达时 {@link AssistantChatService} 会再打开一次。
+ * SSE 订阅在 {@code boundedElastic}，避免占死 Netty 的 HTTP 线程。
  */
 @Slf4j
 @RestController
@@ -1125,20 +965,20 @@ public class AssistantController {
     private final AssistantChatService chatService;
     private final SessionStore sessionStore;
     private final UserMemoryQueryService memoryQueryService;
+    private final HarnessAgent harnessAgent;
 
     /** 健康检查回显当前大模型名，方便运维确认配的是哪套。 */
     @Value("${llm.model}")
     private String model;
-    /** 健康检查回显是否启用智谱 MCP 搜索。 */
-    @Value("${mcp.zhipu.enabled:true}")
-    private boolean mcpEnabled;
 
     public AssistantController(AssistantChatService chatService,
                                SessionStore sessionStore,
-                               UserMemoryQueryService memoryQueryService) {
+                               UserMemoryQueryService memoryQueryService,
+                               HarnessAgent harnessAgent) {
         this.chatService = chatService;
         this.sessionStore = sessionStore;
         this.memoryQueryService = memoryQueryService;
+        this.harnessAgent = harnessAgent;
     }
 
     /**
@@ -1345,35 +1185,44 @@ public class AssistantController {
     }
 
     /**
-     * 前端展示用的能力清单：子 Agent 名 + Harness 已打开的工具名。不访问 Redis。
+     * 前端展示用的能力清单：子 Agent 名 + 当前 Toolkit 真实工具名。
      */
     @GetMapping("/agents")
     public Map<String, Object> agents() {
+        List<String> tools = new ArrayList<>(harnessAgent.getToolkit().getToolNames());
+        tools.sort(Comparator.naturalOrder());
         return Map.of(
                 "agents", List.of("research-agent", "general-purpose"),
-                "harness", List.of(
-                        "todo_write", "filesystem", "agent_spawn",
-                        "memory_search", "memory_get", "memory_save", "session_search",
-                        "search_conversation_history", "get_user_usage",
-                        "plan_mode", "skill_manage"));
+                "harness", tools);
     }
 
     /**
-     * 存活探测 + 运行时关键开关。{@code storage=redis} / {@code multi_replica=true} 表示生产只走 Redis。
+     * 存活探测 + 运行时关键开关。{@code storage=mysql+redis}：AgentState 在 MySQL，
+     * 工作区 / 网页会话 / 待审批在 Redis。
      */
     @GetMapping("/health")
     public Map<String, Object> health() {
-        return Map.of(
-                "status", "ok",
-                "framework", "AgentScope-Java-2.0-HarnessAgent",
-                "edition", "agentscope",
-                "model", model,
-                "mcp_enabled", mcpEnabled,
-                "memory", "official-flush-consolidation",
-                "storage", "redis",
-                "multi_user", true,
-                "multi_replica", true,
-                "version", "2.0.0");
+        List<String> mcpTools = new ArrayList<>();
+        for (String name : harnessAgent.getToolkit().getToolNames()) {
+            AgentTool tool = harnessAgent.getToolkit().getTool(name);
+            if (tool instanceof McpTool) {
+                mcpTools.add(name);
+            }
+        }
+        mcpTools.sort(Comparator.naturalOrder());
+        return Map.ofEntries(
+                Map.entry("status", "ok"),
+                Map.entry("framework", "AgentScope-Java-2.0-HarnessAgent"),
+                Map.entry("edition", "agentscope"),
+                Map.entry("model", model),
+                Map.entry("mcp_enabled", !mcpTools.isEmpty()),
+                Map.entry("mcp", "tools.json"),
+                Map.entry("mcp_tools", mcpTools),
+                Map.entry("memory", "official-flush-consolidation"),
+                Map.entry("storage", "mysql+redis"),
+                Map.entry("multi_user", true),
+                Map.entry("multi_replica", true),
+                Map.entry("version", "2.0.0"));
     }
 
     /**
@@ -1687,7 +1536,7 @@ public class UsageStats {
 
 ### `src/main/resources/application.yml`
 
-**作用：** 端口、模型、MCP、记忆节流、Redis；密钥已脱敏
+**作用：** 端口、模型、MCP、记忆节流、MySQL、Redis；密钥已脱敏
 
 ```yaml
 server:
@@ -1699,29 +1548,36 @@ spring:
   mvc:
     async:
       request-timeout: 330000
+  datasource:
+    url: jdbc:mysql://${MYSQL_HOST:127.0.0.1}:${MYSQL_PORT:3306}/${MYSQL_DATABASE:agentscope_assistant}?useUnicode=true&characterEncoding=UTF-8&connectionCollation=utf8mb4_unicode_ci&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai
+    username: ${MYSQL_USER:root}
+    password: ${MYSQL_PASSWORD:}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      connection-test-query: SELECT 1
+      maximum-pool-size: 20
 
 # OpenAI 兼容（示例为阿里云百炼 / 智谱均可）
 llm:
   base-url: https://llm-inr089bfe37yw1si.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
   api-key: ${LLM_API_KEY:YOUR_LLM_API_KEY}
-  model: qwen3.8-27b
+  model: qwen3.8-max
   temperature: 0.3
   timeout-seconds: 120
-  enable-thinking: false
+  enable-thinking: true
 
+# MCP 按官方工作区约定：只声明在 workspace/tools.json 的 mcpServers。
+# Harness 在 build() 时读文件（远端 overlay 上层 + 本地模板下层），不要编程注入 ToolsConfig。
+# ${MCP_API_KEY} 只认进程环境。IDEA 没 export 时用下面的智谱 key（须是 open.bigmodel.cn 的 API Key）。
 mcp:
-  zhipu:
-    # MCP SDK 0.17.0，与 agentscope 的 json-schema-validator 2.0.0 兼容。默认启用智谱 MCP。
-    # 设 false 回退 RestWebSearchService（直连 LLM web_search）。
-    enabled: true
-    web-search-url: https://open.bigmodel.cn/api/mcp/web_search_prime/mcp
-    web-reader-url: https://open.bigmodel.cn/api/mcp/web_reader/mcp
-    api-key: ${MCP_API_KEY:${LLM_API_KEY:YOUR_ZHIPU_API_KEY}}
+  api-key: ${MCP_API_KEY:YOUR_ZHIPU_API_KEY}
 
 agent:
   workspace: ${user.dir}/workspace
-  max-iters: 80
+  max-iters: 25
   approval-tools: write_file,edit_file
+  # 只读联网工具：不走人工审批（智谱 MCP 缺 readOnlyHint 时也会强制放行）
+  auto-allow-tools: webReader,webSearchPrime
   # 官方分层记忆（见 AgentScopeConfig.memoryConfig）
   # flush-throttle-minutes: 0 = 每轮结束都抽取（ALWAYS）；>0 = 节流分钟数
   memory:
@@ -1734,12 +1590,15 @@ logging:
     cn.deepassistant: INFO
     io.agentscope: INFO
 
-# 生产必填：AgentState、工作区文件、网页会话、待审批都进 Redis。启动 ping 失败直接退出。
-# 不需要 spring.profiles.active=distributed
+# 生产必填。AgentState 用官方 MysqlAgentStateStore（表 agentscope_sessions，可自动建）。
+# 库名必须和 spring.datasource.url 一致。工作区 / 网页会话 / 待审批仍进 Redis。
+# Redis ping 或 MySQL 连不上时进程直接退出。
+mysql:
+  database: ${MYSQL_DATABASE:agentscope_assistant}
 redis:
   host: ${REDIS_HOST:127.0.0.1}
   port: ${REDIS_PORT:6379}
-  password: ${REDIS_PASSWORD:}        # 本地无密码留空
+  password: ${REDIS_PASSWORD:}
   database: ${REDIS_DATABASE:0}
 ```
 
@@ -1750,6 +1609,7 @@ redis:
 ```xml
 <?xml version="1.0" encoding="UTF-8" ?>
 <configuration>
+
     <appender name="Console" class="ch.qos.logback.core.ConsoleAppender">
         <encoder charset="utf-8">
             <pattern>
@@ -1757,17 +1617,19 @@ redis:
             </pattern>
         </encoder>
     </appender>
+
     <appender name="Async" class="ch.qos.logback.classic.AsyncAppender">
         <neverBlock>true</neverBlock>
         <queueSize>10240</queueSize>
         <appender-ref ref="Console"/>
     </appender>
+
     <root level="info">
         <appender-ref ref="Async"/>
     </root>
+
 </configuration>
 ```
-
 聊天走 SSE，真正执行在 `boundedElastic`。HTTP 线程上的 MDC 传不过去，要在工作线程再打开：
 
 - `ConversationMdc.run(sessionId, ...)`：包住 `chatService.chat` / `resume`
@@ -1780,21 +1642,134 @@ redis:
 ```java
 package cn.deepassistant.util;
 
+/**
+ * 把本轮对话的 sessionId 写入 SLF4J MDC，供 {@code logback.xml} 的
+ * {@code %X{SESSION_ID}} 打印。线程局部，用完必须 {@link #clear()}，避免线程池串话。
+ *
+ * <p>不写入 userId：日志里出现用户标识会泄露用户信息。
+ *
+ * <p>SSE 聊天跑在 {@code Schedulers.boundedElastic()}，HTTP 线程上的 MDC 传不过去，
+ * 必须在工作线程再 {@link #run(String, Runnable)} 一次。
+ */
 public final class ConversationMdc {
+
+    /** 与 {@code logback.xml} 里 {@code %X{SESSION_ID}} 的 key 必须一字不差。 */
     public static final String SESSION_ID = "SESSION_ID";
-    private ConversationMdc() {}
-    public static void open(String sessionId) { /* MDC.put / remove */ }
-    public static void clear() { MDC.remove(SESSION_ID); }
+
+    private ConversationMdc() {
+    }
+
+    /**
+     * 把 sessionId 放进当前线程 MDC。空白则移除，避免上一轮残留的 id 被下一条日志带走。
+     *
+     * <p><b>何时调用：</b>本项目拦截器 / Controller，不是 AgentScope。HTTP 线程打 START 日志前；
+     * 工作线程 {@link #run} 里也会再 open 一次。
+     */
+    public static void open(String sessionId) {
+        if (sessionId != null && !sessionId.isBlank()) {
+            MDC.put(SESSION_ID, sessionId);
+        } else {
+            MDC.remove(SESSION_ID);
+        }
+    }
+
+    /** 只清 SESSION_ID，不影响其它业务自己放进 MDC 的 key。 */
+    public static void clear() {
+        MDC.remove(SESSION_ID);
+    }
+
+    /**
+     * 在目标线程打开 MDC，执行完（含抛异常）后清掉。
+     * 用于 SSE 切到 {@code boundedElastic} 的那段，保证 Harness / Redis 日志也带 sessionId。
+     */
     public static void run(String sessionId, Runnable action) {
         open(sessionId);
-        try { action.run(); } finally { clear(); }
+        try {
+            action.run();
+        } finally {
+            clear();
+        }
+    }
+}
+```
+
+### `src/main/java/cn/deepassistant/config/SessionMdcInterceptor.java`
+
+**作用：** 非 SSE 接口从路径 `/api/sessions/{id}` 写入 MDC；`afterCompletion` 必须 `clear()`，Tomcat 线程会复用。聊天 / 续跑的 sessionId 在 JSON body 里，拦截器拿不到，由 Controller 在工作线程 `ConversationMdc.run`。
+
+```java
+package cn.deepassistant.config;
+
+/**
+ * 非 SSE 接口：从路径里的会话 id 写入 MDC。
+ *
+ * <p>聊天 / 续跑的 sessionId 在 JSON body 里，拦截器拿不到，由 {@code AssistantController}
+ * 在工作线程打开。本拦截器覆盖 {@code GET/DELETE /api/sessions/{id}} 这类路径带 id 的请求。
+ */
+@Component
+public class SessionMdcInterceptor implements HandlerInterceptor, WebMvcConfigurer {
+
+    /** 把自己注册到 {@code /api/**}。同一实例既是拦截器又是配置器，避免再拆一个 Config 类。 */
+    @Override
+    public void addInterceptors(InterceptorRegistry registry) {
+        registry.addInterceptor(this).addPathPatterns("/api/**");
+    }
+
+    /**
+     * 请求进入 Controller 之前：能解析出 sessionId 就写入当前 HTTP 线程的 MDC。
+     * 解析不到（列表、新建、聊天）保持空，后面的日志 SESSION_ID 段为空。
+     */
+    @Override
+    public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {
+        String sessionId = pathSessionId(request.getRequestURI());
+        if (sessionId != null) {
+            ConversationMdc.open(sessionId);
+        }
+        return true;
+    }
+
+    /**
+     * 无论 Controller 成功还是抛异常都清 MDC。Tomcat 线程会复用，不清会把上一个会话的 id 漏到下一次请求。
+     */
+    @Override
+    public void afterCompletion(HttpServletRequest request, HttpServletResponse response,
+                                Object handler, Exception ex) {
+        ConversationMdc.clear();
+    }
+
+    /**
+     * 从 URI 抽出 {@code /api/sessions/{id}} 的 id。
+     *
+     * <ul>
+     *   <li>{@code /api/sessions/abc-123} → {@code abc-123}</li>
+     *   <li>{@code /api/sessions}、{@code /api/sessions/}、带多余路径段的都不算单条会话</li>
+     *   <li>query string（{@code ?userId=}）先剥掉再解析</li>
+     * </ul>
+     */
+    static String pathSessionId(String uri) {
+        if (uri == null) {
+            return null;
+        }
+        int q = uri.indexOf('?');
+        String path = q >= 0 ? uri.substring(0, q) : uri;
+        String prefix = "/api/sessions/";
+        int at = path.indexOf(prefix);
+        if (at < 0) {
+            return null;
+        }
+        String rest = path.substring(at + prefix.length());
+        // 空、或还有下一级路径（例如未来 /sessions/{id}/messages）都不当作 sessionId
+        if (rest.isEmpty() || rest.contains("/")) {
+            return null;
+        }
+        return rest;
     }
 }
 ```
 
 ### `pom.xml`
 
-**作用：** Spring Boot 3.2.5 + agentscope-harness 2.0.1 + MCP 0.17.0 + Lettuce
+**作用：** Spring Boot 3.2.5 + agentscope-harness 2.0.1 + MCP 0.17.0 + agentscope-extensions-mysql + Lettuce
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -1826,6 +1801,8 @@ public final class ConversationMdc {
         <!-- 与 agentscope-core 2.0.1 BOM 一致；0.17+ 才能和 json-schema-validator 2.0.0 共存 -->
         <mcp.version>0.17.0</mcp.version>
         <json-schema-validator.version>2.0.0</json-schema-validator.version>
+        <!-- 让 ProcessEnv 能写 System.getenv，供 tools.json 的 ${MCP_API_KEY} -->
+        <jvm.opens>--add-opens java.base/java.lang=ALL-UNNAMED --add-opens java.base/java.util=ALL-UNNAMED</jvm.opens>
     </properties>
 
     <dependencies>
@@ -1869,7 +1846,22 @@ public final class ConversationMdc {
             <groupId>com.fasterxml.jackson.datatype</groupId>
             <artifactId>jackson-datatype-jsr310</artifactId>
         </dependency>
-        <!-- Redis 客户端：多副本分布式状态存储用。用本地已缓存的 5.2.2（内部 nexus 拉不到 6.3.2）。 -->
+        <!-- 官方 AgentState MySQL 实现。DataSource 由 spring-boot-starter-jdbc 提供。 -->
+        <dependency>
+            <groupId>io.agentscope</groupId>
+            <artifactId>agentscope-extensions-mysql</artifactId>
+            <version>${agentscope.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-jdbc</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+        <!-- Redis 客户端：工作区 / 网页会话 / 待审批。钉 5.2.2（内部 nexus 拉不到 6.3.2）。 -->
         <dependency>
             <groupId>io.lettuce</groupId>
             <artifactId>lettuce-core</artifactId>
@@ -1896,12 +1888,20 @@ public final class ConversationMdc {
                 <artifactId>spring-boot-maven-plugin</artifactId>
                 <version>3.2.5</version>
                 <configuration>
+                    <jvmArguments>${jvm.opens}</jvmArguments>
                     <excludes>
                         <exclude>
                             <groupId>org.projectlombok</groupId>
                             <artifactId>lombok</artifactId>
                         </exclude>
                     </excludes>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <argLine>${jvm.opens}</argLine>
                 </configuration>
             </plugin>
         </plugins>
@@ -1913,7 +1913,7 @@ public final class ConversationMdc {
 
 ### `src/main/resources/static/index.html`
 
-**作用：** 深色对话 UI；侧栏用户框；SSE 审批卡；`localStorage.pa_userId` / `pa_sessionId`。过期 session 返回 400「会话不存在」时清本地 id，不再弹吓人的「加载会话失败」。
+**作用：** 深色对话 UI。发送后立刻「思考中」动效；思考原文可折叠；工具/搜索/子任务做成步骤条（转圈 → 打勾）。侧栏用户框；SSE 审批卡；`localStorage.pa_userId` / `pa_sessionId`。过期 session 返回 400「会话不存在」时清本地 id。
 
 ````html
 <!DOCTYPE html>
@@ -2110,6 +2110,105 @@ public final class ConversationMdc {
   }
   .agent-block { border-color: #3a4a5a; background: #1a2834; color: #9ec9e0; }
   .plan-block { border-color: #5a4a28; background: #2a2418; color: #e8c98a; }
+  .activity {
+    max-width: 820px;
+    margin: 0 0 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .status-row, .think-block, .step-row {
+    color: var(--text-dim);
+    font-size: 13px;
+  }
+  .status-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 2px 8px;
+  }
+  .status-label.live, .think-title.live {
+    background: linear-gradient(90deg, #6d8494 0%, #d7e6ef 45%, #6d8494 90%);
+    background-size: 200% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    animation: shimmer 1.8s linear infinite;
+  }
+  @keyframes shimmer {
+    from { background-position: 100% 0; }
+    to { background-position: -100% 0; }
+  }
+  .spinner {
+    width: 12px;
+    height: 12px;
+    border: 1.5px solid #3a4e5c;
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin .7s linear infinite;
+    flex-shrink: 0;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .step-icon {
+    width: 14px;
+    height: 14px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+  .step-icon.done::before {
+    content: "";
+    width: 8px;
+    height: 4px;
+    border-left: 1.5px solid var(--ok);
+    border-bottom: 1.5px solid var(--ok);
+    transform: rotate(-45deg) translateY(-1px);
+  }
+  .think-block, .step-row {
+    border: none;
+    background: transparent;
+  }
+  .think-block > summary, .step-row > summary {
+    list-style: none;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 2px;
+    user-select: none;
+  }
+  .think-block > summary::-webkit-details-marker,
+  .step-row > summary::-webkit-details-marker { display: none; }
+  .think-block > summary::after, .step-row > summary::after {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-right: 1.5px solid var(--text-dim);
+    border-bottom: 1.5px solid var(--text-dim);
+    transform: rotate(-45deg);
+    margin-left: 4px;
+    opacity: .7;
+  }
+  .think-block[open] > summary::after, .step-row[open] > summary::after {
+    transform: rotate(45deg);
+  }
+  .think-title, .step-label { color: var(--text-dim); }
+  .think-block.done .think-title, .step-row.done .step-label { color: #9fb3c2; }
+  .think-body, .step-detail {
+    margin: 0 0 6px 22px;
+    padding: 8px 10px;
+    border-left: 1px solid #2a3b48;
+    font-size: 12px;
+    line-height: 1.55;
+    color: #8aa0b0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 240px;
+    overflow: auto;
+  }
+  .step-detail { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .msg.assistant .bubble.is-empty { display: none; }
   .approval-card {
     margin-top: 8px;
     padding: 12px 14px;
@@ -2308,7 +2407,7 @@ public final class ConversationMdc {
     </div>
     <label class="toggle">
       <input type="checkbox" id="showTools" checked>
-      显示工具调用
+      显示思考与工具
     </label>
   </header>
 
@@ -2385,8 +2484,8 @@ el.userIdInput.addEventListener('change', () => {
 el.showTools.addEventListener('change', () => {
   state.showTools = el.showTools.checked;
   localStorage.setItem('pa_showTools', state.showTools);
-  document.querySelectorAll('.tool-block,.agent-block,.plan-block').forEach(n => {
-    n.style.display = state.showTools ? 'block' : 'none';
+  document.querySelectorAll('.tool-block,.agent-block,.plan-block,.step-row,.think-block').forEach(n => {
+    n.style.display = state.showTools ? '' : 'none';
   });
 });
 
@@ -2440,12 +2539,215 @@ function appendBubble(role, content) {
   ensureEmptyHidden();
   const wrap = document.createElement('div');
   wrap.className = 'msg ' + role;
+  const body = role === 'assistant' ? mdLite(content) : escapeHtml(content);
   wrap.innerHTML = `<div class="role">${role === 'user' ? '你' : '助手'}</div>
-    <div class="bubble">${role === 'assistant' ? mdLite(content) : escapeHtml(content)}</div>
+    <div class="activity"></div>
+    <div class="bubble">${body}</div>
     <div class="extras"></div>`;
+  const bubble = wrap.querySelector('.bubble');
+  if (role === 'assistant') {
+    bubble.dataset.raw = content || '';
+    if (!content) bubble.classList.add('is-empty');
+  }
   el.messages.appendChild(wrap);
   el.messages.scrollTop = el.messages.scrollHeight;
   return wrap;
+}
+
+function appendAssistantShell() {
+  const wrap = appendBubble('assistant', '');
+  showStatus(wrap, '思考中');
+  return wrap;
+}
+
+function activityOf(wrap) {
+  let act = wrap.querySelector('.activity');
+  if (!act) {
+    act = document.createElement('div');
+    act.className = 'activity';
+    const bubble = wrap.querySelector('.bubble');
+    wrap.insertBefore(act, bubble || wrap.querySelector('.extras'));
+  }
+  return act;
+}
+
+function showStatus(wrap, label) {
+  const act = activityOf(wrap);
+  let row = act.querySelector('.status-row');
+  if (!row) {
+    row = document.createElement('div');
+    row.className = 'status-row';
+    act.insertBefore(row, act.firstChild);
+  }
+  row.innerHTML = `<span class="spinner"></span><span class="status-label live">${escapeHtml(label)}</span>`;
+}
+
+function hideStatus(wrap) {
+  const row = wrap.querySelector('.status-row');
+  if (row) row.remove();
+}
+
+function parseJson(data, fallback) {
+  if (data && typeof data === 'object') return data;
+  try { return JSON.parse(data); } catch (e) { return fallback || {}; }
+}
+
+const TOOL_LABELS = {
+  webSearchPrime: '联网搜索',
+  webReader: '阅读网页',
+  web_search: '联网搜索',
+  web_fetch: '读取网页',
+  calculate: '计算',
+  getCurrentDateTime: '查询时间',
+  todo_write: '更新计划',
+  agent_spawn: '委派子任务',
+  agent_send: '联系子任务',
+  read_file: '读取文件',
+  write_file: '写入文件',
+  edit_file: '编辑文件',
+  list_files: '列出文件',
+  memory_search: '检索记忆',
+  memory_get: '读取记忆',
+  memory_save: '保存记忆',
+  session_search: '检索会话日志',
+  search_conversation_history: '检索对话',
+  get_user_usage: '查看使用概况',
+  skill_manage: '管理技能',
+};
+
+function toolLabel(name) {
+  if (!name) return '调用工具';
+  return TOOL_LABELS[name] || ('调用 ' + name);
+}
+
+function ensureThink(wrap, startNew) {
+  const act = activityOf(wrap);
+  let block = act.querySelector('.think-block.live');
+  if (!block || startNew) {
+    if (block) finishThink(block);
+    hideStatus(wrap);
+    block = document.createElement('details');
+    block.className = 'think-block live';
+    block.open = true;
+    block.innerHTML = `<summary>
+        <span class="step-icon"><span class="spinner"></span></span>
+        <span class="think-title live">思考中</span>
+      </summary>
+      <div class="think-body"></div>`;
+    if (!state.showTools) block.style.display = 'none';
+    act.appendChild(block);
+  }
+  return block;
+}
+
+function appendThinkDelta(wrap, text) {
+  if (!text) return;
+  const block = ensureThink(wrap, false);
+  const body = block.querySelector('.think-body');
+  body.textContent = (body.textContent || '') + text;
+  el.messages.scrollTop = el.messages.scrollHeight;
+}
+
+function finishThink(block) {
+  if (!block) return;
+  block.classList.remove('live');
+  block.classList.add('done');
+  const title = block.querySelector('.think-title');
+  if (title) {
+    title.classList.remove('live');
+    title.textContent = block.querySelector('.think-body')?.textContent?.trim()
+      ? '已思考' : '已思考';
+  }
+  const icon = block.querySelector('.step-icon');
+  if (icon) icon.innerHTML = '';
+  icon && icon.classList.add('done');
+  const body = block.querySelector('.think-body');
+  if (!body || !body.textContent.trim()) {
+    if (body) body.remove();
+    block.open = false;
+  } else {
+    block.open = false;
+  }
+}
+
+function renderThinkDone(wrap, text) {
+  if (!text) return;
+  hideStatus(wrap);
+  const act = activityOf(wrap);
+  const block = document.createElement('details');
+  block.className = 'think-block done';
+  block.innerHTML = `<summary>
+      <span class="step-icon done"></span>
+      <span class="think-title">已思考</span>
+    </summary>
+    <div class="think-body">${escapeHtml(text)}</div>`;
+  if (!state.showTools) block.style.display = 'none';
+  act.appendChild(block);
+}
+
+function upsertStep(wrap, payload, kind) {
+  hideStatus(wrap);
+  const name = payload.tool || payload.name || payload.event || '工具';
+  const id = payload.id || name;
+  const key = (kind || 'tool') + ':' + id;
+  const act = activityOf(wrap);
+  let row = Array.from(act.querySelectorAll('.step-row')).find(n => n.dataset.step === key);
+  const running = payload.phase !== 'end' && payload.state !== 'ERROR';
+  if (!row) {
+    row = document.createElement('details');
+    row.className = 'step-row ' + (kind || 'tool');
+    row.dataset.step = key;
+    row.innerHTML = `<summary>
+        <span class="step-icon">${running ? '<span class="spinner"></span>' : ''}</span>
+        <span class="step-label"></span>
+      </summary>
+      <pre class="step-detail"></pre>`;
+    if (!state.showTools) row.style.display = 'none';
+    act.appendChild(row);
+  }
+  const label = row.querySelector('.step-label');
+  label.textContent = kind === 'agent'
+    ? ('子任务' + (payload.name ? ' · ' + payload.name : ''))
+    : (kind === 'plan' ? '更新计划' : toolLabel(name));
+  const icon = row.querySelector('.step-icon');
+  const done = payload.phase === 'end' || payload.state === 'ERROR' || payload.state === 'DENIED';
+  if (done) {
+    row.classList.add('done');
+    row.classList.remove('live');
+    icon.classList.add('done');
+    icon.innerHTML = '';
+    if (payload.state === 'ERROR' || payload.state === 'DENIED') {
+      label.textContent += payload.state === 'DENIED' ? '（已拒绝）' : '（失败）';
+    }
+  } else {
+    row.classList.add('live');
+    if (!icon.querySelector('.spinner')) icon.innerHTML = '<span class="spinner"></span>';
+  }
+  const detail = row.querySelector('.step-detail');
+  const extra = payload.args || payload.data || payload.event;
+  if (extra && typeof extra === 'object') {
+    detail.textContent = JSON.stringify(extra, null, 2);
+  } else if (typeof extra === 'string' && extra && extra.charAt(0) === '{') {
+    try { detail.textContent = JSON.stringify(JSON.parse(extra), null, 2); }
+    catch (e) { detail.textContent = extra; }
+  } else if (payload.tool || payload.name) {
+    detail.textContent = payload.tool || payload.name;
+  }
+  el.messages.scrollTop = el.messages.scrollHeight;
+}
+
+function finishActivity(wrap) {
+  hideStatus(wrap);
+  wrap.querySelectorAll('.think-block.live').forEach(finishThink);
+  wrap.querySelectorAll('.step-row.live').forEach(row => {
+    row.classList.remove('live');
+    row.classList.add('done');
+    const icon = row.querySelector('.step-icon');
+    if (icon) {
+      icon.classList.add('done');
+      icon.innerHTML = '';
+    }
+  });
 }
 
 function appendMeta(wrap, cls, text) {
@@ -2591,22 +2893,7 @@ async function openSession(id) {
     if (m.role === 'user' || m.role === 'assistant') {
       const wrap = appendBubble(m.role, m.content || '');
       const isLast = idx === messages.length - 1;
-      (m.events || []).forEach(ev => {
-        if (ev.type === 'plan') appendMeta(wrap, 'plan-block', '计划\n' + (ev.todos || ''));
-        if (ev.type === 'tool' || ev.type === 'tool_start' || ev.type === 'tool_end') {
-          appendMeta(wrap, 'tool-block', '工具\n' + JSON.stringify(ev));
-        }
-        if (ev.type === 'agent' || ev.type === 'agent_start' || ev.type === 'agent_end') {
-          appendMeta(wrap, 'agent-block', '子Agent\n' + JSON.stringify(ev));
-        }
-        if (ev.type === 'interrupt') {
-          if (isLast && detail.pendingApproval) {
-            appendApprovalCard(wrap, ev);
-          } else if (state.showTools) {
-            appendMeta(wrap, 'plan-block', '⏸ 审批记录\n' + JSON.stringify(ev));
-          }
-        }
-      });
+      (m.events || []).forEach(ev => replayEvent(wrap, ev, isLast && detail.pendingApproval));
     }
   });
   loadSessions();
@@ -2681,9 +2968,8 @@ async function send() {
   state.streaming = true;
   el.input.value = '';
   appendBubble('user', text);
-  const aiWrap = appendBubble('assistant', '思考中…');
+  const aiWrap = appendAssistantShell();
   const bubble = aiWrap.querySelector('.bubble');
-  bubble.textContent = '';
 
   const abort = new AbortController();
   state.abort = abort;
@@ -2696,13 +2982,18 @@ async function send() {
       signal: abort.signal
     });
     if (!res.ok) {
+      bubble.classList.remove('is-empty');
       bubble.textContent = '请求失败 HTTP ' + res.status;
+      hideStatus(aiWrap);
       return;
     }
     await consumeSse(res, (event, data) => handleSse(event, data, aiWrap, bubble));
+    finishActivity(aiWrap);
   } catch (e) {
     if (e.name !== 'AbortError') {
+      bubble.classList.remove('is-empty');
       bubble.textContent = '请求失败: ' + e.message;
+      hideStatus(aiWrap);
     }
   } finally {
     if (state.abort === abort) state.abort = null;
@@ -2722,6 +3013,7 @@ async function resumeApproval(card, approved) {
 
   const aiWrap = card.closest('.msg');
   const bubble = aiWrap.querySelector('.bubble');
+  showStatus(aiWrap, approved ? '继续执行' : '调整方案');
   const resultLine = document.createElement('div');
   resultLine.className = 'approval-result';
   resultLine.textContent = approved ? '✅ 已批准，继续执行…' : '🚫 已拒绝，让模型调整方案…';
@@ -2739,9 +3031,11 @@ async function resumeApproval(card, approved) {
     });
     if (!res.ok) {
       resultLine.textContent += '（续跑请求失败 HTTP ' + res.status + '）';
+      hideStatus(aiWrap);
       return;
     }
     await consumeSse(res, (event, data) => handleSse(event, data, aiWrap, bubble));
+    finishActivity(aiWrap);
   } catch (e) {
     if (e.name !== 'AbortError') {
       resultLine.textContent += '（续跑失败: ' + e.message + '）';
@@ -2775,27 +3069,76 @@ function appendApprovalCard(aiWrap, payload) {
   el.btnSend.title = '有待审批的操作，请先在上方批准或拒绝';
 }
 
+function replayEvent(wrap, ev, pendingInterrupt) {
+  const type = ev.type;
+  if (type === 'thinking') {
+    renderThinkDone(wrap, ev.text || '');
+    return;
+  }
+  const payload = Object.assign({}, ev, parseJson(ev.data, {}));
+  if (type === 'plan' || type === 'tool' || type === 'tool_start' || type === 'tool_end') {
+    payload.phase = payload.phase || 'end';
+    upsertStep(wrap, payload, type === 'plan' ? 'plan' : 'tool');
+    return;
+  }
+  if (type === 'agent' || type === 'agent_start' || type === 'agent_end') {
+    payload.phase = payload.phase || 'end';
+    upsertStep(wrap, payload, 'agent');
+    return;
+  }
+  if (type === 'interrupt') {
+    if (pendingInterrupt) {
+      appendApprovalCard(wrap, payload);
+    } else if (state.showTools) {
+      upsertStep(wrap, Object.assign({phase: 'end', state: 'DENIED'}, payload), 'tool');
+    }
+  }
+}
+
 function handleSse(event, data, aiWrap, bubble) {
   if (event === 'session') {
     state.sessionId = data;
     localStorage.setItem('pa_sessionId', data);
     el.currentSession.textContent = data;
+  } else if (event === 'status') {
+    const payload = parseJson(data, {});
+    if (!aiWrap.querySelector('.think-block.live') && !aiWrap.querySelector('.step-row.live')) {
+      showStatus(aiWrap, payload.label === 'thinking' ? '思考中' : (payload.label || '处理中'));
+    }
+  } else if (event === 'thinking') {
+    const payload = parseJson(data, {});
+    if (payload.phase === 'start') {
+      ensureThink(aiWrap, true);
+    } else if (payload.phase === 'delta') {
+      appendThinkDelta(aiWrap, payload.text || '');
+    } else if (payload.phase === 'end') {
+      const live = aiWrap.querySelector('.think-block.live');
+      if (live) finishThink(live);
+    }
   } else if (event === 'token') {
+    hideStatus(aiWrap);
+    const live = aiWrap.querySelector('.think-block.live');
+    if (live) finishThink(live);
+    bubble.classList.remove('is-empty');
     bubble.innerHTML = mdLite((bubble.dataset.raw || '') + data);
     bubble.dataset.raw = (bubble.dataset.raw || '') + data;
     el.messages.scrollTop = el.messages.scrollHeight;
   } else if (event === 'plan') {
-    appendMeta(aiWrap, 'plan-block', '计划\n' + data);
+    upsertStep(aiWrap, parseJson(data, {tool: 'todo_write', phase: 'start'}), 'plan');
   } else if (event === 'tool') {
-    appendMeta(aiWrap, 'tool-block', '工具\n' + data);
+    upsertStep(aiWrap, parseJson(data, {phase: 'start'}), 'tool');
   } else if (event === 'agent') {
-    appendMeta(aiWrap, 'agent-block', '子Agent\n' + data);
+    upsertStep(aiWrap, parseJson(data, {phase: 'start'}), 'agent');
   } else if (event === 'interrupt') {
-    let payload = {};
-    try { payload = JSON.parse(data); } catch (e) { /* 忽略解析失败，仍展示原文 */ }
-    appendApprovalCard(aiWrap, payload);
+    hideStatus(aiWrap);
+    finishActivity(aiWrap);
+    appendApprovalCard(aiWrap, parseJson(data, {}));
   } else if (event === 'error') {
+    hideStatus(aiWrap);
+    bubble.classList.remove('is-empty');
     bubble.textContent = (bubble.dataset.raw || '') + '\n[错误] ' + data;
+  } else if (event === 'done') {
+    finishActivity(aiWrap);
   }
 }
 
@@ -2805,7 +3148,6 @@ if (state.sessionId) openSession(state.sessionId);
 </body>
 </html>
 ````
-
 
 ## 十一、工作区模板与仓库文件
 
@@ -2847,10 +3189,11 @@ if (state.sessionId) openSession(state.sessionId);
 ## 怎么选路径（按优先级）
 1. **直接回答**：闲聊、定义解释、已有上下文足够的问题 —— 不用工具
 2. **轻量工具**：只需当前时间或算术 —— 用 getCurrentDateTime / calculate
-3. **规划**：≥3 步、多目标、或用户明确要求清单 —— 用 todo_write 或 Plan Mode；简单任务不要为了规划而规划
-4. **委派**：需要联网调研 / 隔离上下文的专科活 —— 用 agent_spawn；多个互相独立的子任务可以在同一轮并行 spawn。你自己不要假装已联网搜索
-5. **工作区**：需要落盘长文、草稿、中间结果 —— 用 read_file / write_file / edit_file / list_files（write_file / edit_file 会触发人工审批）
-6. **技能**：需要某个技能细节时按需加载；值得沉淀的做法可以写成技能草稿
+3. **联网**：用 `webSearchPrime` 搜索、`webReader` 打开链接（智谱 MCP）。不要找 `web_search` / `browser` / `web_fetch`，那些已关闭。简单查询直接调这两个工具；不要编造搜索结果
+4. **规划**：≥3 步、多目标、或用户明确要求清单 —— 用 todo_write 或 Plan Mode；简单任务不要为了规划而规划
+5. **委派**：需要多角度交叉验证的调研 —— 用 agent_spawn 调 research-agent（它同样使用 webSearchPrime / webReader）
+6. **工作区**：需要落盘长文、草稿、中间结果 —— 用 read_file / write_file / edit_file / list_files（write_file / edit_file 会触发人工审批）
+7. **技能**：需要某个技能细节时按需加载；值得沉淀的做法可以写成技能草稿
 
 ## 如何写好 agent_spawn 委派
 - task 必须写清：目标、约束、期望输出格式（例如「分点结论 + 来源链接」）
@@ -2915,41 +3258,60 @@ description: 周报撰写规范：固定章节、字数与语气。需要写周�
 
 ### `workspace/subagents/research-agent.md`
 
-**作用：** research-agent 子 Agent 提示词与工具白名单
+**作用：** 官方子 Agent 声明（YAML frontmatter + 正文）。Harness `DynamicSubagentsMiddleware` Layer 2 自动扫描本目录，**无需** Java `.subagents(...)`。
 
 ```markdown
 ---
-description: 复杂联网调研：多角度搜索、交叉验证、带来源的结论摘要（智谱 Web Search）
+description: 复杂联网调研：多角度搜索、交叉验证、带来源的结论摘要（智谱 Web Search MCP）
 workspace:
   mode: isolated
-tools: [webSearch, webRead, getCurrentDateTime, calculate]
+tools: [webSearchPrime, webReader, getCurrentDateTime, calculate]
+maxIters: 25
 ---
 
-你是 research-agent——复杂联网查询专科子 Agent。
+你是 research-agent——复杂联网查询专科子 Agent（ephemeral leaf）。
+
+联网工具由父 Agent Toolkit 继承：`webSearchPrime`（搜索）、`webReader`（读网页）。
+这两个是只读工具，**不需要人工审批**；直接调用即可。
+本子 Agent 是 isolated 工作区，**不要**根据这里有没有 `tools.json` 判断工具是否可用。
+函数列表里有这两个工具时必须直接调用；禁止声称「工具未加载」后用训练知识编造调研。
 
 ## 工作流（必须遵守）
 1. 把用户子任务拆成 2~5 个可检索角度（不同关键词 / 时间 / 来源侧重点）
-2. 对每个角度调用 webSearch；需要深读时用 webRead
+2. 对每个角度调用 webSearchPrime；需要深读时用 webReader
 3. 交叉比对多源结果，标出一致点与冲突点
-4. 输出结构化结论：
+4. 输出结构化结论（最终回复会回传父 Agent「小深」）：
    - 核心结论（分点）
    - 证据与来源链接（真实来自工具结果，禁止编造）
    - 时效性说明（何时的信息）
    - 不确定性 / 仍待核实项
 
 ## 约束
-- 只完成统筹分配的这一个子任务
+- 只完成统筹分配的这一个子任务；做完即止，不要扮演主助手
+- **不要**维护或写入长期记忆（MEMORY.md / memory/ 日流水）；持久事实由父 Agent 负责
 - 搜索词尽量具体；必要时换关键词重搜，不要用同一词盲目重试超过 2 次
 - 没有检索到就如实说明，不要编造链接或数据
 ```
 
 ### `workspace/tools.json`
 
-**作用：** 工作区工具 deny 列表
+**作用：** 官方工具 deny + MCP server。`getenv` 有密钥时 `ToolsConfigLoader` 读文件；否则 yml 密钥替换 `${MCP_API_KEY}` 后 `toolsConfig()`。传输用智谱 SSE 回退（Java SDK 对 `/mcp` GET 会 405）。
 
 ```json
 {
-  "deny": ["web_search", "web_fetch", "execute"]
+  "deny": ["web_search", "web_fetch", "execute"],
+  "mcpServers": {
+    "zhipu-web-search": {
+      "transport": "sse",
+      "url": "https://open.bigmodel.cn/api/mcp/web_search_prime/sse?Authorization=${MCP_API_KEY}",
+      "timeout": "PT60S"
+    },
+    "zhipu-web-reader": {
+      "transport": "sse",
+      "url": "https://open.bigmodel.cn/api/mcp/web_reader/sse?Authorization=${MCP_API_KEY}",
+      "timeout": "PT60S"
+    }
+  }
 }
 ```
 
@@ -2967,6 +3329,8 @@ target/
 .DS_Store
 *.log
 .env
+# Harness 运行时产物（记忆 / 会话 / 子 Agent 工作区走 Redis，本地仅可能留下索引）
+# workspace/agents/ = 运行时隔离目录；声明文件在 workspace/subagents/*.md（应提交）
 workspace/.index/
 workspace/agents/
 workspace/memory/*.md
@@ -2979,70 +3343,290 @@ workspace/plans/*.md
 
 ## 十二、测试
 
-`mvn test` 覆盖 MCP 0.17 适配、记忆解析、会话检索、MDC，以及本机 Redis 集成（只 FLUSHDB **db=15**，不碰应用 db=0）。
+`mvn test` 覆盖 `tools.json` MCP 声明、MDC、记忆解析、会话检索，以及本机 Redis / MySQL 集成（Redis 只 FLUSHDB **db=15**，MySQL 只用 `agentscope_assistant_test`）。
 
-### `src/test/java/cn/deepassistant/integration/mcp/McpToolSupportTest.java`
+### `src/test/java/cn/deepassistant/integration/mcp/ToolsJsonTest.java`
 
-**作用：** MCP 0.17 schema 选参与 CallToolResult 文本化
+**作用：** 断言 `workspace/tools.json` 声明智谱 MCP SSE 回退，且可反序列化为官方 `ToolsConfig`。不要写 `allow`。
 
 ```java
 package cn.deepassistant.integration.mcp;
 
-class McpToolSupportTest {
+class ToolsJsonTest {
 
     @Test
-    void argumentKeysPreferSchemaNamesOverHardcodedGuesses() {
-        McpSchema.JsonSchema schema = new McpSchema.JsonSchema(
-                "object",
-                Map.of("search_query", Map.of("type", "string")),
-                List.of("search_query"),
-                null,
-                null,
-                null);
-
-        assertEquals(List.of("search_query"),
-                McpToolSupport.argumentKeys(schema, List.of("query", "search_query", "q")));
+    void officialMcpServersAreDeclared() throws Exception {
+        Path file = Path.of("workspace/tools.json");
+        assertTrue(Files.isRegularFile(file), "workspace/tools.json 应存在");
+        JsonNode root = new ObjectMapper().readTree(file.toFile());
+        assertTrue(root.path("allow").isMissingNode() || root.path("allow").isEmpty(),
+                "不要用 allow 白名单，否则 Harness 内置工具会被一起砍掉");
+        assertTrue(root.path("deny").toString().contains("web_search"));
+        JsonNode servers = root.path("mcpServers");
+        assertTrue(servers.has("zhipu-web-search"));
+        assertTrue(servers.has("zhipu-web-reader"));
+        JsonNode search = servers.get("zhipu-web-search");
+        assertEquals("sse", search.path("transport").asText());
+        assertTrue(search.path("url").asText().contains("web_search_prime/sse"));
+        assertTrue(search.path("url").asText().contains("${MCP_API_KEY}"));
+        assertTrue(servers.get("zhipu-web-reader").path("url").asText().contains("web_reader/sse"));
     }
 
     @Test
-    void argumentKeysFallBackToRequiredWhenPreferredMissing() {
-        McpSchema.JsonSchema schema = new McpSchema.JsonSchema(
-                "object",
-                Map.of("keyword", Map.of("type", "string")),
-                List.of("keyword"),
-                null,
-                null,
-                null);
+    void toolsJsonParsesAsOfficialToolsConfig() throws Exception {
+        String raw = Files.readString(Path.of("workspace/tools.json"));
+        ToolsConfig cfg = new ObjectMapper()
+                .registerModule(new JavaTimeModule())
+                .readValue(raw, ToolsConfig.class);
+        assertNotNull(cfg.getMcpServers());
+        assertEquals(2, cfg.getMcpServers().size());
+        assertTrue(cfg.getDeny().contains("web_search"));
+        assertEquals(Duration.parse("PT60S"), cfg.getMcpServers().get("zhipu-web-search").getTimeout());
+        assertEquals("sse", cfg.getMcpServers().get("zhipu-web-search").getTransport());
+        assertTrue(cfg.getMcpServers().get("zhipu-web-search").getUrl().contains("/sse?Authorization=${MCP_API_KEY}"));
+    }
+}
+```
 
-        assertEquals(List.of("keyword"),
-                McpToolSupport.argumentKeys(schema, List.of("query", "search_query")));
+### `src/test/java/cn/deepassistant/config/WorkspaceRootsTest.java`
+
+**作用：** 配置路径已有种子则沿用；否则回退到模块 `workspace/`。
+
+```java
+package cn.deepassistant.config;
+
+class WorkspaceRootsTest {
+
+    @TempDir
+    Path temp;
+
+    @Test
+    void keepsConfiguredPathWhenItAlreadyHasSeeds() throws Exception {
+        Path ws = temp.resolve("workspace");
+        Files.createDirectories(ws);
+        Files.writeString(ws.resolve("tools.json"), "{}");
+        Path resolved = WorkspaceRoots.resolve(ws.toString(), WorkspaceRoots.class);
+        assertEquals(ws.toAbsolutePath().normalize(), resolved);
     }
 
     @Test
-    void matchesToolUsesNameTitleAndDescription() {
-        McpSchema.Tool tool = McpSchema.Tool.builder()
-                .name("webSearchPrime")
-                .title("联网搜索")
-                .description("Search the web")
-                .build();
-        assertTrue(McpToolSupport.matchesTool(tool, "search", "webSearchPrime"));
-        assertEquals("webSearchPrime", McpToolSupport.toolName(tool));
+    void fallsBackToModuleWorkspaceWhenConfiguredPathHasNoSeeds() {
+        Path bogus = temp.resolve("agentscope").resolve("workspace");
+        Path resolved = WorkspaceRoots.resolve(bogus.toString(), WorkspaceRoots.class);
+        assertTrue(Files.isRegularFile(resolved.resolve("tools.json")), resolved.toString());
+        assertTrue(Files.isRegularFile(resolved.resolve("AGENTS.md")), resolved.toString());
+    }
+}
+```
+
+### `src/test/java/cn/deepassistant/util/ProcessEnvTest.java`
+
+**作用：** 空值不写 getenv；JVM 允许写入时不覆盖已有非空值，不允许则返回 false。
+
+```java
+package cn.deepassistant.util;
+
+class ProcessEnvTest {
+
+    @Test
+    void blankValueIsNotWritten() {
+        assertFalse(ProcessEnv.ensure("MCP_API_KEY_TEST_BLANK", "  "));
+        assertFalse(ProcessEnv.ensure(" ", "x"));
     }
 
     @Test
-    void stringifyReadsTextContentThenStructuredObject() {
-        McpSchema.CallToolResult text = McpSchema.CallToolResult.builder()
-                .addTextContent("hello")
-                .isError(false)
-                .build();
-        assertEquals("hello", McpToolSupport.stringify(text));
+    void writesWhenJvmAllowsOrReportsFailure() {
+        String key = "AS_TEST_ENV_" + UUID.randomUUID().toString().replace("-", "");
+        boolean ok = ProcessEnv.ensure(key, "v1");
+        if (ok) {
+            assertEquals("v1", System.getenv(key));
+            assertTrue(ProcessEnv.ensure(key, "v2"));
+            assertEquals("v1", System.getenv(key), "已有非空 env 不覆盖");
+        } else {
+            String now = System.getenv(key);
+            assertTrue(now == null || now.isBlank());
+        }
+    }
+}
+```
 
-        McpSchema.CallToolResult structured = McpSchema.CallToolResult.builder()
-                .isError(false)
-                .structuredContent(Map.of("title", "结果"))
-                .build();
-        assertTrue(McpToolSupport.stringify(structured).contains("title"));
-        assertTrue(McpToolSupport.stringify(structured).contains("结果"));
+### `src/test/java/cn/deepassistant/service/AgentEventMapperTest.java`
+
+**作用：** 断言 thinking / status 为 live；工具 start 带 name/id；todo → plan 频道。
+
+```java
+package cn.deepassistant.service;
+
+class AgentEventMapperTest {
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final AgentEventMapper mapper = new AgentEventMapper(objectMapper);
+
+    @Test
+    void modelCallStartBecomesLiveStatus() throws Exception {
+        AgentEventMapper.MappedEvent mapped = mapper.map(new ModelCallStartEvent("r1"));
+        assertEquals("status", mapped.event());
+        assertFalse(mapped.persist());
+        assertEquals("thinking", objectMapper.readTree(mapped.data()).path("label").asText());
+    }
+
+    @Test
+    void thinkingDeltasAreLiveAndEndPersists() throws Exception {
+        AgentEventMapper.MappedEvent started = mapper.map(new ThinkingBlockStartEvent("r1", "b1"));
+        assertEquals("thinking", started.event());
+        assertFalse(started.persist());
+
+        AgentEventMapper.MappedEvent streamed = mapper.map(
+                new ThinkingBlockDeltaEvent("r1", "b1", "先搜一下"));
+        assertEquals("thinking", streamed.event());
+        assertFalse(streamed.persist());
+        assertEquals("先搜一下", objectMapper.readTree(streamed.data()).path("text").asText());
+
+        AgentEventMapper.MappedEvent finished = mapper.map(new ThinkingBlockEndEvent("r1", "b1"));
+        assertTrue(finished.persist());
+        assertEquals("end", objectMapper.readTree(finished.data()).path("phase").asText());
+    }
+
+    @Test
+    void emptyThinkingDeltaIsSkipped() {
+        assertTrue(mapper.map(new ThinkingBlockDeltaEvent("r1", "b1", "")).skipped());
+    }
+
+    @Test
+    void toolLifecycleKeepsNameAndId() throws Exception {
+        AgentEventMapper.MappedEvent mapped = mapper.map(
+                new ToolCallStartEvent("r1", "tc-1", "webSearchPrime"));
+        assertEquals("tool", mapped.event());
+        JsonNode json = objectMapper.readTree(mapped.data());
+        assertEquals("webSearchPrime", json.path("tool").asText());
+        assertEquals("tc-1", json.path("id").asText());
+        assertEquals("start", json.path("phase").asText());
+    }
+
+    @Test
+    void todoToolGoesToPlanChannel() {
+        AgentEventMapper.MappedEvent mapped = mapper.map(
+                new ToolCallStartEvent("r1", "tc-2", "todo_write"));
+        assertEquals("plan", mapped.event());
+    }
+
+    @Test
+    void toolResultEndIncludesState() throws Exception {
+        JsonNode json = objectMapper.readTree(mapper.map(
+                new ToolResultEndEvent("r1", "tc-2", "calculate", ToolResultState.SUCCESS)).data());
+        assertEquals("end", json.path("phase").asText());
+        assertEquals("SUCCESS", json.path("state").asText());
+    }
+
+    @Test
+    void textDeltaIsToken() {
+        AgentEventMapper.MappedEvent mapped = mapper.map(new TextBlockDeltaEvent("r1", "b1", "你好"));
+        assertEquals("token", mapped.event());
+        assertEquals("你好", mapped.data());
+        assertTrue(mapped.persist());
+    }
+}
+```
+
+### `src/test/java/cn/deepassistant/service/AgentActivityLoggerTest.java`
+
+**作用：** clip 超长加字数；api-key 打码；从 JSON args 抽出搜索词 / URL。
+
+```java
+package cn.deepassistant.service;
+
+class AgentActivityLoggerTest {
+
+    @Test
+    void clipAddsLengthWhenTruncated() {
+        String clipped = AgentActivityLogger.clip("abcdefghij", 4);
+        assertEquals("abcd...(10字)", clipped);
+    }
+
+    @Test
+    void redactHidesApiKeys() {
+        String raw = "{\"query\":\"杭州天气\",\"api-key\":\"sk-secret\"}";
+        String redacted = AgentActivityLogger.redact(raw);
+        assertTrue(redacted.contains("杭州天气"));
+        assertTrue(redacted.contains("***"));
+        assertFalse(redacted.contains("sk-secret"));
+    }
+
+    @Test
+    void searchQueryReadsCommonKeys() {
+        assertEquals("杭州天气",
+                AgentActivityLogger.searchQuery("webSearchPrime", "{\"query\":\"杭州天气\"}"));
+        assertEquals("https://example.com",
+                AgentActivityLogger.searchQuery("webReader", "{\"url\":\"https://example.com\"}"));
+        assertTrue(AgentActivityLogger.isSearch("webSearchPrime"));
+        assertTrue(AgentActivityLogger.isSearch("webReader"));
+        assertFalse(AgentActivityLogger.isSearch("calculate"));
+    }
+
+    @Test
+    void toolDeltasAccumulateWithoutThrowing() {
+        AgentActivityLogger logger = new AgentActivityLogger();
+        logger.accept(new ToolCallStartEvent("r1", "tc-1", "webSearchPrime"));
+        logger.accept(new ToolCallDeltaEvent("r1", "tc-1", "webSearchPrime", "{\"query\":\""));
+        logger.accept(new ToolCallDeltaEvent("r1", "tc-1", "webSearchPrime", "杭州\"}"));
+        logger.accept(new ToolCallEndEvent("r1", "tc-1", "webSearchPrime"));
+        logger.accept(new ToolResultTextDeltaEvent("r1", "tc-1", "webSearchPrime", "晴 18℃"));
+        logger.accept(new ToolResultEndEvent("r1", "tc-1", "webSearchPrime", ToolResultState.SUCCESS));
+        logger.finish("今天晴", false, false);
+    }
+}
+```
+
+### `src/test/java/cn/deepassistant/util/ConversationMdcTest.java`
+
+**作用：** MDC 写入 SESSION_ID；`run` 抛异常也要 clear
+
+```java
+package cn.deepassistant.util;
+
+class ConversationMdcTest {
+
+    @AfterEach
+    void tearDown() {
+        ConversationMdc.clear();
+    }
+
+    @Test
+    void openPutsSessionIdForLogback() {
+        ConversationMdc.open("sess-1");
+        assertEquals("sess-1", MDC.get(ConversationMdc.SESSION_ID));
+    }
+
+    @Test
+    void runClearsMdcEvenWhenActionThrows() {
+        try {
+            ConversationMdc.run("sess-1", () -> {
+                throw new IllegalStateException("boom");
+            });
+        } catch (IllegalStateException ignored) {
+            // expected
+        }
+        assertNull(MDC.get(ConversationMdc.SESSION_ID));
+    }
+}
+```
+
+### `src/test/java/cn/deepassistant/config/SessionMdcInterceptorTest.java`
+
+**作用：** 从 `/api/sessions/{id}` 抽出 sessionId，列表/聊天路径返回 null
+
+```java
+package cn.deepassistant.config;
+
+class SessionMdcInterceptorTest {
+
+    @Test
+    void extractsSessionIdFromSessionsPath() {
+        assertEquals("abc-123", SessionMdcInterceptor.pathSessionId("/api/sessions/abc-123"));
+        assertEquals("abc-123", SessionMdcInterceptor.pathSessionId("/api/sessions/abc-123?userId=alice"));
+        assertNull(SessionMdcInterceptor.pathSessionId("/api/sessions"));
+        assertNull(SessionMdcInterceptor.pathSessionId("/api/sessions/"));
+        assertNull(SessionMdcInterceptor.pathSessionId("/api/assistant/chat"));
     }
 }
 ```
@@ -3103,18 +3687,165 @@ class SessionStoreSearchTest {
 }
 ```
 
+### `src/test/java/cn/deepassistant/mysql/MysqlAgentStateStoreTest.java`
+
+**作用：** 直连官方 `io.agentscope.extensions.mysql.state.MysqlAgentStateStore`。只用独立库 `agentscope_assistant_test`，连不上则跳过。
+
+```java
+package cn.deepassistant.mysql;
+
+/**
+ * 直连本地 MySQL 验证官方 {@link MysqlAgentStateStore}。
+ *
+ * <p>只用独立库 {@code agentscope_assistant_test}，绝不碰应用默认的
+ * {@code agentscope_assistant}。连不上或建库失败时测试方法直接 return。
+ */
+class MysqlAgentStateStoreTest {
+
+    private static final String TEST_DATABASE = "agentscope_assistant_test";
+
+    private static MysqlAgentStateStore store;
+    private static boolean available;
+
+    @BeforeAll
+    static void connect() {
+        String host = env("MYSQL_HOST", "127.0.0.1");
+        String port = env("MYSQL_PORT", "3306");
+        String user = env("MYSQL_USER", "root");
+        String password = env("MYSQL_PASSWORD", "");
+        String adminUrl = "jdbc:mysql://" + host + ":" + port
+                + "/?useUnicode=true&characterEncoding=UTF-8&useSSL=false"
+                + "&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai";
+        try (Connection conn = DriverManager.getConnection(adminUrl, user, password);
+             Statement stmt = conn.createStatement()) {
+            stmt.execute("CREATE DATABASE IF NOT EXISTS " + TEST_DATABASE
+                    + " CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+        } catch (Exception e) {
+            available = false;
+            return;
+        }
+        DriverManagerDataSource ds = new DriverManagerDataSource();
+        ds.setDriverClassName("com.mysql.cj.jdbc.Driver");
+        ds.setUrl("jdbc:mysql://" + host + ":" + port + "/" + TEST_DATABASE
+                + "?useUnicode=true&characterEncoding=UTF-8&useSSL=false"
+                + "&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai");
+        ds.setUsername(user);
+        ds.setPassword(password);
+        try {
+            store = new MysqlAgentStateStore(ds, TEST_DATABASE, "agentscope_sessions", true);
+            available = true;
+        } catch (Exception e) {
+            available = false;
+        }
+    }
+
+    @BeforeEach
+    void truncate() {
+        if (available) {
+            store.truncateAllSessions();
+        }
+    }
+
+    @Test
+    void agentStateStoreSaveGetDeleteRoundTrip() {
+        if (!available) return;
+
+        MapState state = wrap(Map.of("summary", "测试对话", "curIter", 3));
+        store.save("alice", "sess1", "agent", state);
+
+        Optional<MapState> got = store.get("alice", "sess1", "agent", MapState.class);
+        assertTrue(got.isPresent());
+        assertEquals("测试对话", got.get().getSummary());
+        assertEquals(3, got.get().getCurIter());
+
+        assertTrue(store.exists("alice", "sess1"));
+        assertFalse(store.exists("alice", "sess2"));
+        assertFalse(store.exists("bob", "sess1"));
+
+        assertEquals(Set.of("sess1"), store.listSessionIds("alice"));
+
+        store.delete("alice", "sess1");
+        assertFalse(store.exists("alice", "sess1"));
+        assertTrue(store.listSessionIds("alice").isEmpty());
+    }
+
+    @Test
+    void agentStateStoreIsolatesUsers() {
+        if (!available) return;
+
+        store.save("alice", "s1", "agent", wrap(Map.of("summary", "alice的对话")));
+        store.save("bob", "s1", "agent", wrap(Map.of("summary", "bob的对话")));
+
+        assertEquals("alice的对话",
+                store.get("alice", "s1", "agent", MapState.class).orElseThrow().getSummary());
+        assertEquals("bob的对话",
+                store.get("bob", "s1", "agent", MapState.class).orElseThrow().getSummary());
+
+        assertEquals(Set.of("s1"), store.listSessionIds("alice"));
+        assertEquals(Set.of("s1"), store.listSessionIds("bob"));
+
+        store.delete("alice", "s1");
+        assertFalse(store.exists("alice", "s1"));
+        assertTrue(store.exists("bob", "s1"));
+    }
+
+    @Test
+    void listSlotRewritesWhenContentChanges() {
+        if (!available) return;
+
+        store.save("alice", "sess1", "tasks", List.of(
+                wrap(Map.of("summary", "t1")),
+                wrap(Map.of("summary", "t2"))));
+        List<MapState> first = store.getList("alice", "sess1", "tasks", MapState.class);
+        assertEquals(2, first.size());
+        assertEquals("t1", first.get(0).getSummary());
+        assertEquals("t2", first.get(1).getSummary());
+
+        store.save("alice", "sess1", "tasks", List.of(wrap(Map.of("summary", "only"))));
+        List<MapState> replaced = store.getList("alice", "sess1", "tasks", MapState.class);
+        assertEquals(1, replaced.size());
+        assertEquals("only", replaced.get(0).getSummary());
+    }
+
+    private static MapState wrap(Map<String, Object> m) {
+        MapState s = new MapState();
+        s.setSummary((String) m.get("summary"));
+        Object c = m.get("curIter");
+        s.setCurIter(c == null ? 0 : ((Number) c).intValue());
+        return s;
+    }
+
+    private static String env(String key, String fallback) {
+        String v = System.getenv(key);
+        return v == null || v.isBlank() ? fallback : v;
+    }
+
+    public static class MapState implements io.agentscope.core.state.State {
+        private String summary;
+        private int curIter;
+
+        public String getSummary() { return summary; }
+        public void setSummary(String summary) { this.summary = summary; }
+        public int getCurIter() { return curIter; }
+        public void setCurIter(int curIter) { this.curIter = curIter; }
+    }
+}
+```
+
 ### `src/test/java/cn/deepassistant/redis/RedisStoresIntegrationTest.java`
 
-**作用：** Redis 状态/工作区隔离与 CAS。连 **db=15**，只 FLUSHDB 测试库。
+**作用：** Redis 工作区隔离与 CAS。连 **db=15**，只 FLUSHDB 测试库。AgentState 见上节 MySQL 测例。
 
 ```java
 package cn.deepassistant.redis;
 
 /**
- * 直连本地 Redis（127.0.0.1:6379 <b>db=15</b>）验证 {@link RedisAgentStateStore} 和 {@link RedisBaseStore}。
+ * 直连本地 Redis（127.0.0.1:6379 <b>db=15</b>）验证 {@link RedisBaseStore}。
  *
  * <p>需要本地 Redis 在跑。只 FLUSHDB <b>测试库 15</b>，绝不碰应用默认的 db=0
  * （网页会话 {@code as:web:} 也在 db=0，以前测例会把真实对话清掉）。
+ * AgentState 已迁到官方 {@link io.agentscope.extensions.mysql.state.MysqlAgentStateStore}，
+ * 见 {@link cn.deepassistant.mysql.MysqlAgentStateStoreTest}。
  * 如果本地没 Redis，测试方法直接 return。
  */
 class RedisStoresIntegrationTest {
@@ -3162,53 +3893,6 @@ class RedisStoresIntegrationTest {
     }
 
     @Test
-    void agentStateStoreSaveGetDeleteRoundTrip() {
-        if (!available) return;
-        RedisAgentStateStore store = new RedisAgentStateStore(redis);
-
-        // 用一个最简单的 State 实现：直接存 Map 当 JSON
-        Map<String, Object> state = Map.of("summary", "测试对话", "curIter", 3);
-        store.save("alice", "sess1", "agent", wrap(state));
-
-        Optional<MapState> got = store.get("alice", "sess1", "agent", MapState.class);
-        assertTrue(got.isPresent());
-        assertEquals("测试对话", got.get().getSummary());
-        assertEquals(3, got.get().getCurIter());
-
-        assertTrue(store.exists("alice", "sess1"));
-        assertFalse(store.exists("alice", "sess2"));
-        assertFalse(store.exists("bob", "sess1"));
-
-        Set<String> ids = store.listSessionIds("alice");
-        assertEquals(Set.of("sess1"), ids);
-
-        store.delete("alice", "sess1");
-        assertFalse(store.exists("alice", "sess1"));
-        assertTrue(store.listSessionIds("alice").isEmpty());
-    }
-
-    @Test
-    void agentStateStoreIsolatesUsers() {
-        if (!available) return;
-        RedisAgentStateStore store = new RedisAgentStateStore(redis);
-
-        store.save("alice", "s1", "agent", wrap(Map.of("summary", "alice的对话")));
-        store.save("bob", "s1", "agent", wrap(Map.of("summary", "bob的对话")));
-
-        // 同名 sessionId，不同 userId，互不干扰
-        assertEquals("alice的对话", store.get("alice", "s1", "agent", MapState.class).orElseThrow().getSummary());
-        assertEquals("bob的对话", store.get("bob", "s1", "agent", MapState.class).orElseThrow().getSummary());
-
-        assertEquals(Set.of("s1"), store.listSessionIds("alice"));
-        assertEquals(Set.of("s1"), store.listSessionIds("bob"));
-
-        // 删 alice 不影响 bob
-        store.delete("alice", "s1");
-        assertFalse(store.exists("alice", "s1"));
-        assertTrue(store.exists("bob", "s1"));
-    }
-
-    @Test
     void baseStorePutGetSearchDelete() {
         if (!available) return;
         RedisBaseStore store = new RedisBaseStore(redis);
@@ -3249,50 +3933,43 @@ class RedisStoresIntegrationTest {
         store.delete(ns, "MEMORY.md");
         assertEquals(null, store.get(ns, "MEMORY.md"));
     }
-
-    /** 用 MapState 当一个能被 JsonCodec 序列化的 State。 */
-    private static MapState wrap(Map<String, Object> m) {
-        MapState s = new MapState();
-        s.setSummary((String) m.get("summary"));
-        Object c = m.get("curIter");
-        s.setCurIter(c == null ? 0 : ((Number) c).intValue());
-        return s;
-    }
-
-    /** 最简单的 State 实现，有 summary / curIter 两个字段，能被官方 JsonCodec 序列化。 */
-    public static class MapState implements io.agentscope.core.state.State {
-        private String summary;
-        private int curIter;
-
-        public String getSummary() { return summary; }
-        public void setSummary(String summary) { this.summary = summary; }
-        public int getCurIter() { return curIter; }
-        public void setCurIter(int curIter) { this.curIter = curIter; }
-    }
 }
 ```
 
 ## 3. 设计取舍与踩坑笔记
 
+**存储怎么分（最佳实践，详见上篇 1.6）**
+
+对话状态进 MySQL 求稳，热文件和短生命周期进 Redis 求快。`MysqlDistributedStore.create()` 是「全进 MySQL、不跑 Redis」的开关，不是更高级的写法：它会把 MEMORY.md 也改成 `JdbcStore`，并带上用不到的沙箱快照 / `GET_LOCK()`，网页会话和 pending 它还是管不到。`create()` 默认库名是 `agentscope`，和本项目 JDBC 的 `agentscope_assistant` 对不上。
+
 1. **用官方 Harness，不复刻 LangGraph 类结构**：产品能力对齐 `deepagents-assistant-java`，代码走 `HarnessAgent.builder()`。
 2. **记忆只接线、不自抽**：`.memory(MemoryConfig)` + 中文 flush/consolidation 提示；`HarnessMemoryCatalog` 只读 `WorkspaceManager`。
 3. **循环依赖用 `ObjectProvider`**：`harnessAgent → historyMemoryTools → harnessMemoryCatalog → harnessAgent`。`@Lazy` 失败是因为 `HarnessAgent` 没有可见构造器，CGLIB 代理不了。
 4. **MCP 必须 0.17.0+**：0.14.1 的 `DefaultJsonSchemaValidator` 引用 `SpecVersion.VersionFlag`（1.x），agentscope 的 `ToolValidator` 需要 `json-schema-validator:2.0.0`（该类已删除）。两者不能靠 pin 1.x 共存。
-5. **MCP 初始化失败不能拖垮启动**：`ZhipuMcpWebSearchService.tryBuildClient` 吃掉异常，搜索接口返回明确错误；设 `mcp.zhipu.enabled=false` 回退 REST。
-6. **`structuredContent` 是 Object**：0.17 起不再是 `Map`；`McpToolSupport.stringify` 同时处理 TextContent / Map / List。
-7. **按 inputSchema 选参数名**：不要盲猜 `query` / `search_query`。
-8. **隔离从 Redis key 做起**：`UserIds`/`SessionIds` 白名单；会话 `as:web:{userId}:{sessionId}`；pending `as:pending:{userId}:{sessionId}`。
-9. **RemoteFilesystem 必须配 DistributedStore**：官方 `build()` 会检查。默认启动就是这套，没有 JSON 互迁路径。
-10. **Lettuce 版本看内网仓库**：本示例钉 `5.2.2.RELEASE`，因为内部 Nexus 拉不到 6.3.x。
-11. **关掉无约束 Shell**：个人助手默认 `.disableShellTool()`，避免模型乱跑系统命令。
-12. **Qwen 关掉思考模式**：`enable_thinking=false`，流式 tool_call 更稳。
-13. **SSE 多行 `data:`**：前端按规范拼接到空行为止，否则只显示第一句。
-14. **网页历史 ≠ 官方 session_search**：一个是 Redis `as:web:`，一个是压缩卸载 jsonl。工具描述里写清楚。
-15. **`-parameters` 编译**：否则 `@ToolParam` 可能变成 `arg0`。
-16. **Redis 集成测试只清 db=15**：以前测例 `FLUSHDB` db=0 会把开发对话整库删掉。
-17. **日志不要打 userId**：`logback.xml` 只放 `%X{SESSION_ID}`。聊天在 `boundedElastic` 上跑，必须在工作线程 `ConversationMdc.run`，HTTP 线程设一次会丢。
-18. **过期 localStorage sessionId**：Redis 被清或换库后，打开旧 id 返回 400「会话不存在」；前端 `resetToNewChat()`，不要只弹「加载会话失败」。
-19. **Java 重启不丢对话**：数据在 Redis。侧栏空了先查 db=0 的 `as:web-index:{userId}`，以及侧栏当前用户是不是 `kpye` / `local`。
+5. **MCP 初始化失败不能拖垮启动**：2.0.1 `McpServerRegistrar` 单条失败只 warn，其余 server 继续注册。没有 REST 回退。
+6. **密钥：getenv 优先，yml 回退**：官方 `${MCP_API_KEY}` 只认 `System.getenv`。JDK 17 默认写不进 getenv（`substituting empty string` 然后智谱 401「令牌已过期」其实是空 Bearer）。`ProcessEnv.ensure` 失败后用 yml `mcp.api-key` 做同等替换。必须是智谱 Key，不要用百炼 Key。
+7. **智谱 `/mcp` + Java SDK = GET 405**：Streamable HTTP 握手成功后 SDK 再 GET SSE，智谱 `handleGet` 返回 405 / `Session not found`。`tools.json` 按文档走 `/sse?Authorization=`。
+8. **IDEA Working directory**：`${user.dir}/workspace` 指错工程会找不到 `tools.json`。`WorkspaceRoots` 用 `target/classes` 反推模块工作区。
+9. **`/api/agents` 不要写死工具名**：清单和 `health.mcp_tools` 读 Toolkit 真实 `McpTool`，否则 MCP 没注册也会显示 `webSearchPrime`。
+10. **按 inputSchema 选参数名**：不要盲猜 `query` / `search_query`。
+11. **隔离从 (userId, sessionId) 做起**：`UserIds`/`SessionIds` 白名单；AgentState 在 MySQL 列上；会话 `as:web:{userId}:{sessionId}`；pending `as:pending:{userId}:{sessionId}`。
+12. **RemoteFilesystem 必须配 DistributedStore**：官方 `build()` 会检查。AgentState 可以不是 Redis，但 `DistributedStore` 两边都要有实现。
+13. **Lettuce 版本看内网仓库**：本示例钉 `5.2.2.RELEASE`，因为内部 Nexus 拉不到 6.3.x。
+14. **关掉无约束 Shell**：个人助手默认 `.disableShellTool()`，避免模型乱跑系统命令。
+15. **思考模式与前端活动流**：yml 当前 `enable-thinking: true`，会推 `ThinkingBlock*`，页面可展开「已思考」。Qwen 开思考时流式 tool_call 可能不稳，异常时改回 `false`。关掉后仍有 `ModelCallStart` → SSE `status`（思考中）和工具步骤。后台 `AgentActivityLogger` 打工具参数、`[Search]` 检索词/结果、思考与作答预览；过长截断，api-key 打码，**不打 userId**。
+16. **SSE 多行 `data:`**：前端按规范拼接到空行为止，否则只显示第一句。
+17. **网页历史 ≠ 官方 session_search**：一个是 Redis `as:web:`，一个是压缩卸载 jsonl。工具描述里写清楚。
+18. **`-parameters` 编译**：否则 `@ToolParam` 可能变成 `arg0`。
+19. **Redis 集成测试只清 db=15**：以前测例 `FLUSHDB` db=0 会把开发对话整库删掉。MySQL 测例只用 `agentscope_assistant_test`。
+20. **日志不要打 userId**：`logback.xml` 只放 `%X{SESSION_ID}`。聊天在 `boundedElastic` 上跑，必须在工作线程 `ConversationMdc.run`，HTTP 线程设一次会丢。
+21. **过期 localStorage sessionId**：Redis 被清或换库后，打开旧 id 返回 400「会话不存在」；前端 `resetToNewChat()`，不要只弹「加载会话失败」。
+22. **Java 重启不丢对话**：AgentState 在 MySQL。网页会话 / MEMORY.md 在 Redis——生产给 Redis 开 AOF 或 RDB，否则重启 Redis 会丢长期记忆。侧栏空了先查 db=0 的 `as:web-index:{userId}`，以及侧栏当前用户是不是 `kpye` / `local`。
+23. **官方 MysqlAgentStateStore 库名必须和 JDBC URL 一致**：SQL 用 `` `库`.`表` ``。`createIfNotExist=true` 可自动建库建表 `agentscope_sessions`。用 `DistributedStore.builder()` 混搭，不要 `MysqlDistributedStore.create()`。
+24. **SSE 必须真 Flux**：`AssistantChatService` 直接订阅 `streamEvents`，不要 `toIterable()` 阻塞；Controller 也不要再包一层阻塞循环。
+25. **同会话互斥**：`RedisSessionRunLock`；删会话时取消进行中的订阅，避免 finish 写回已删会话。
+26. **审批用 claim**：`resume` 先 claim 再续跑；抢锁失败要把审批单写回，否则用户卡死。
+27. **子 Agent 用官方 md**：放 `workspace/subagents/*.md`，不要再维护 `SubagentConfigs` / `.subagents(...)`。isolated 专科默认仍会继承父记忆 hooks——若要「完全不 Flush」，需额外定制（本仓库当前按官方默认）。
+28. **MCP 给子 Agent**：`build()` 前 `McpServerRegistrar.register` + `auto-allow-tools` 强制只读；否则 isolated 工作区没有 `tools.json`，子 Agent 看不到 `webSearchPrime`。
 
 ---
 
@@ -3306,10 +3983,10 @@ class RedisStoresIntegrationTest {
 | GET/DELETE | `/api/sessions/{id}` | 详情 / 删除 |
 | GET | `/api/history/search?q=` | 网页会话库关键词检索 |
 | GET | `/api/memory` | 使用概况 + MEMORY.md + 日流水 |
-| GET | `/api/agents` | 子 Agent / 官方工具说明 |
-| GET | `/api/health` | `storage=redis`，`multi_replica=true`，`multi_user=true` |
+| GET | `/api/agents` | 子 Agent + Toolkit 真实工具名 |
+| GET | `/api/health` | `storage=mysql+redis`；`mcp_enabled` / `mcp_tools` 看是否真注册了 MCP |
 
-SSE 事件：`session` / `token` / `plan` / `tool` / `agent` / `interrupt` / `error` / `done`。
+SSE 事件：`session` / `status` / `thinking` / `token` / `plan` / `tool` / `agent` / `interrupt` / `error` / `done`。
 
 ---
 
@@ -3321,9 +3998,10 @@ SSE 事件：`session` / `token` / `plan` / `tool` / `agent` / `interrupt` / `er
 - 官方记忆管线负责跨会话事实，应用只读、不抢写
 - 文件权限 + 人工审批保证写操作可控
 - `(userId, sessionId)` + `IsolationScope.USER` 保证多用户不串数据
-- 全部运行时状态进 Redis，任意副本可读可续跑；Java 重启不丢，`FLUSHDB` db=0 会丢
+- AgentState 进 MySQL 求稳，工作区 / 网页会话 / 审批进 Redis 求快；任意副本可读可续跑
+- 不要用 `MysqlDistributedStore.create()`：那是全进 MySQL 的开关，会把热路径工作区也改成 JDBC
 
-如果你要扩展，最自然的切入点通常是：在 `workspace/subagents/` 加一个子 Agent 提示词、在 `Toolkit` 上再注册一个 `@Tool`，或给 Redis 换集群地址——不必改 ReAct 内核。
+如果你要扩展，最自然的切入点通常是：在 `workspace/subagents/` 加一个子 Agent 提示词、在 `Toolkit` 上再注册一个 `@Tool`，或给 MySQL / Redis 换地址——不必改 ReAct 内核，也不必把存储收成单一后端。
 
 对照阅读：`deepagents-assistant-java/docs/小深-Deep-Agents-Harness-Java架构博客.md`（LangGraph4j 自研实现）和本文（官方 Harness 接线）是同一产品的两条学习路径。
 

@@ -2,7 +2,7 @@
  * 记忆分三层，对应 AgentScope Java 2.0 官方文档，而不是原 LangGraph 项目自己的 MemoryStore。
  *
  * <pre>
- *  ① 短期：当前会话 messages（Redis AgentState）+ 本项目 SessionStore（网页侧栏，Redis as:web:）
+ *  ① 短期：当前会话 messages（MySQL AgentState）+ 本项目 SessionStore（网页侧栏，Redis as:web:）
  *  ② 中期日流水：memory/YYYY-MM-DD.md（RemoteFilesystem → Redis）
  *       由官方 MemoryFlushMiddleware 在每次 call 结束后后台抽取（只追加、不去重）
  *  ③ 长期策划：MEMORY.md（同上）

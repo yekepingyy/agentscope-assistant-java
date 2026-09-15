@@ -12,13 +12,17 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 import java.util.Map;
 
-import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * 直连本地 Redis（127.0.0.1:6379 <b>db=15</b>）验证 {@link RedisAgentStateStore} 和 {@link RedisBaseStore}。
+ * 直连本地 Redis（127.0.0.1:6379 <b>db=15</b>）验证 {@link RedisBaseStore}。
  *
  * <p>需要本地 Redis 在跑。只 FLUSHDB <b>测试库 15</b>，绝不碰应用默认的 db=0
  * （网页会话 {@code as:web:} 也在 db=0，以前测例会把真实对话清掉）。
+ * AgentState 已迁到官方 {@link io.agentscope.extensions.mysql.state.MysqlAgentStateStore}，
+ * 见 {@link cn.deepassistant.mysql.MysqlAgentStateStoreTest}。
  * 如果本地没 Redis，测试方法直接 return。
  */
 class RedisStoresIntegrationTest {
@@ -65,8 +69,6 @@ class RedisStoresIntegrationTest {
         }
     }
 
-
-
     @Test
     void baseStorePutGetSearchDelete() {
         if (!available) return;
@@ -107,25 +109,5 @@ class RedisStoresIntegrationTest {
         // delete
         store.delete(ns, "MEMORY.md");
         assertEquals(null, store.get(ns, "MEMORY.md"));
-    }
-
-    /** 用 MapState 当一个能被 JsonCodec 序列化的 State。 */
-    private static MapState wrap(Map<String, Object> m) {
-        MapState s = new MapState();
-        s.setSummary((String) m.get("summary"));
-        Object c = m.get("curIter");
-        s.setCurIter(c == null ? 0 : ((Number) c).intValue());
-        return s;
-    }
-
-    /** 最简单的 State 实现，有 summary / curIter 两个字段，能被官方 JsonCodec 序列化。 */
-    public static class MapState implements io.agentscope.core.state.State {
-        private String summary;
-        private int curIter;
-
-        public String getSummary() { return summary; }
-        public void setSummary(String summary) { this.summary = summary; }
-        public int getCurIter() { return curIter; }
-        public void setCurIter(int curIter) { this.curIter = curIter; }
     }
 }

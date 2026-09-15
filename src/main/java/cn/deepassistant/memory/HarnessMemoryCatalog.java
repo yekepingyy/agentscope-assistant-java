@@ -17,7 +17,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
 
-
 /**
  * 只读目录：把官方 Harness 已经写到 Redis 工作区的记忆文件读出来给前端 / 工具用。
  *
@@ -28,7 +27,7 @@ import java.util.UUID;
  * {@link WorkspaceManager#readMemoryMd(RuntimeContext)} /
  * {@link WorkspaceManager#listMemoryFilePaths(RuntimeContext)} /
  * {@link WorkspaceManager#readManagedWorkspaceFileUtf8(RuntimeContext, String)}，
- * 保证和框架写入的路径完全一致——Local / Remote 文件系统都兼容。
+ * 保证和框架写入的路径完全一致（RemoteFilesystem / Redis）。
  *
  * <h3>为什么用 {@link ObjectProvider} 而不是直接注入 {@link HarnessAgent}</h3>
  * 存在循环依赖：{@code harnessAgent (bean) → historyMemoryTools → harnessMemoryCatalog → harnessAgent}。
@@ -53,7 +52,11 @@ public class HarnessMemoryCatalog {
         this.harnessAgentProvider = harnessAgentProvider;
     }
 
-    /** 首次调用时从 harnessAgent 拿 WorkspaceManager，之后缓存。 */
+    /** 首次调用时从 harnessAgent 拿 WorkspaceManager，之后缓存。
+     *
+     * <p><b>何时调用：</b>本类第一次读记忆文件时（档案页或 {@code get_user_usage} 工具）。
+     * 不能在构造期调，否则和 HarnessAgent Bean 循环依赖。
+     */
     private WorkspaceManager workspaceManager() {
         WorkspaceManager wm = workspaceManager;
         if (wm == null) {
@@ -69,13 +72,24 @@ public class HarnessMemoryCatalog {
         return wm;
     }
 
-    /** 读指定用户的 MEMORY.md。 */
+    /**
+     * 读指定用户的 MEMORY.md。
+     *
+     * <p><b>何时调用：</b>{@code GET /api/memory}、工具 {@code get_user_usage}。
+     * 内部是官方 {@code WorkspaceManager.readMemoryMd}，会再进 {@code RemoteFilesystem} → RedisBaseStore.get。
+     * 写 MEMORY.md 的是框架 Consolidator，不是这个方法。
+     */
     public String readMemoryMarkdown(String userId) {
         String uid = UserIds.normalize(userId);
         return workspaceManager().readMemoryMd(runtimeContext(uid));
     }
 
-    /** 列指定用户的日流水文件。用官方 WorkspaceManager 列路径，再逐个读内容——Local/Remote 文件系统都兼容。 */
+    /**
+     * 列指定用户的日流水文件。用官方 WorkspaceManager 列路径，再逐个读内容。
+     *
+     * <p><b>何时调用：</b>{@code GET /api/memory}、工具 {@code get_user_usage}。
+     * {@code listMemoryFilePaths} 在框架里会 {@code RemoteFilesystem} search。
+     */
     public List<DailyMemoryFile> listDailyLedgers(String userId) {
         String uid = UserIds.normalize(userId);
         RuntimeContext ctx = runtimeContext(uid);
@@ -108,12 +122,17 @@ public class HarnessMemoryCatalog {
     /**
      * 把指定用户 MEMORY.md 里的 {@code - 条目} 拆成列表，给档案页用。
      * 分类只能从当前小节标题猜，猜不到就叫 {@code fact}。
+     *
+     * <p><b>何时调用：</b>仅 {@code GET /api/memory}。AgentScope 不调。
      */
     public List<MemoryFact> parseFactsFromMemoryMd(String userId) {
         return parseFacts(readMemoryMarkdown(userId));
     }
 
-    /** 纯函数，方便单测：不碰磁盘。 */
+    /** 纯函数，方便单测：不碰磁盘。
+     *
+     * <p><b>何时调用：</b>{@link #parseFactsFromMemoryMd} 以及单测。
+     */
     static List<MemoryFact> parseFacts(String md) {
         List<MemoryFact> facts = new ArrayList<>();
         if (md == null || md.isBlank()) {
@@ -163,6 +182,11 @@ public class HarnessMemoryCatalog {
         return "fact";
     }
 
+    /**
+     * 只带 userId 的 RuntimeContext，给 WorkspaceManager 做 IsolationScope.USER 路由。
+     *
+     * <p><b>何时调用：</b>本类读记忆时。不需要 sessionId：MEMORY.md 是用户级，不是会话级。
+     */
     private static RuntimeContext runtimeContext(String userId) {
         return RuntimeContext.builder()
                 .userId(userId)

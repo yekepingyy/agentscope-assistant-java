@@ -9,6 +9,7 @@ import cn.deepassistant.util.SessionIds;
 import cn.deepassistant.util.UserIds;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.lettuce.core.SetArgs;
 import io.lettuce.core.api.sync.RedisCommands;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -20,6 +21,8 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.UUID;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
@@ -39,6 +42,9 @@ import java.util.stream.Collectors;
 public class SessionStore {
 
     private static final String SESSION_PREFIX = "as:web:";
+    /** 网页会话/索引 TTL：90 天无写入则过期。 */
+    private static final long SESSION_TTL_SECONDS = 90L * 24 * 3600;
+
     private static final String INDEX_PREFIX = "as:web-index:";
 
     private final ObjectMapper mapper;
@@ -62,9 +68,49 @@ public class SessionStore {
         return INDEX_PREFIX + userId;
     }
 
+    private static String writeLockKey(String userId, String sessionId) {
+        return "as:web-lock:" + userId + ":" + sessionId;
+    }
+
     /**
-     * 同一 (user, session) 的读写串行化。多副本之间仍靠 Redis，这把锁只防本 JVM 并发写同一条。
+     * 跨副本短锁：包住读改写整份 JSON，降低多实例互相覆盖丢消息的概率。
+     * 拿不到锁就短暂重试；仍失败则抛错，避免静默丢写。
      */
+    private <T> T withRedisLock(String userId, String sessionId, Callable<T> action) {
+        String lk = writeLockKey(userId, sessionId);
+        String token = UUID.randomUUID().toString();
+        boolean locked = false;
+        for (int i = 0; i < 50; i++) {
+            String ok = redis.set(lk, token, SetArgs.Builder.nx().ex(5));
+            if (ok != null && "OK".equalsIgnoreCase(ok)) {
+                locked = true;
+                break;
+            }
+            try {
+                Thread.sleep(20L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("等待会话写锁被中断", e);
+            }
+        }
+        if (!locked) {
+            throw new IllegalStateException("会话繁忙，请稍后重试: " + userId + "/" + sessionId);
+        }
+        try {
+            return action.call();
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IllegalStateException("会话写入失败: " + e.getMessage(), e);
+        } finally {
+            String cur = redis.get(lk);
+            if (token.equals(cur)) {
+                redis.del(lk);
+            }
+        }
+    }
+
+    /** 同一 (user, session) 的读写串行化。多副本之间靠 Redis 写锁，这把锁只防本 JVM 并发。 */
     private Object lockFor(String userId, String sessionId) {
         return fileLocks.computeIfAbsent(key(userId, sessionId), k -> new Object());
     }
@@ -98,29 +144,31 @@ public class SessionStore {
     public SessionDetail getOrCreate(String userId, String sessionId, String firstUserMessage) {
         String uid = UserIds.normalize(userId);
         String id = SessionIds.normalizeOrCreate(sessionId);
-        synchronized (lockFor(uid, id)) {
-            SessionDetail detail = load(uid, id);
-            if (detail == null) {
-                Instant now = Instant.now();
-                String title = buildTitle(firstUserMessage);
-                detail = SessionDetail.builder()
-                        .id(id)
-                        .title(title)
-                        .createdAt(now)
-                        .updatedAt(now)
-                        .messages(new ArrayList<>())
-                        .build();
-                persist(uid, detail);
-                upsertIndex(uid, SessionSummary.builder()
-                        .id(id)
-                        .title(title)
-                        .preview(previewOf(firstUserMessage))
-                        .updatedAt(now)
-                        .messageCount(0)
-                        .build());
+        return withRedisLock(uid, id, () -> {
+            synchronized (lockFor(uid, id)) {
+                SessionDetail detail = load(uid, id);
+                if (detail == null) {
+                    Instant now = Instant.now();
+                    String title = buildTitle(firstUserMessage);
+                    detail = SessionDetail.builder()
+                            .id(id)
+                            .title(title)
+                            .createdAt(now)
+                            .updatedAt(now)
+                            .messages(new ArrayList<>())
+                            .build();
+                    persist(uid, detail);
+                    upsertIndex(uid, SessionSummary.builder()
+                            .id(id)
+                            .title(title)
+                            .preview(previewOf(firstUserMessage))
+                            .updatedAt(now)
+                            .messageCount(0)
+                            .build());
+                }
+                return detail;
             }
-            return detail;
-        }
+        });
     }
 
     /** 只读一条会话全文。不存在返回 null，由 Controller 转成「会话不存在」。
@@ -142,30 +190,64 @@ public class SessionStore {
      * <p><b>何时调用：</b>{@code AssistantChatService} 在用户消息入库、助手回复入库、审批等待说明入库时。
      * AgentScope 的对话上下文不走这里（那份在 AgentStateStore）。
      */
-    public void appendMessage(String userId, String sessionId, ChatMessageRecord record) {
+    public boolean appendMessage(String userId, String sessionId, ChatMessageRecord record) {
         String uid = UserIds.normalize(userId);
         String id = SessionIds.requireValid(sessionId);
-        synchronized (lockFor(uid, id)) {
-            SessionDetail detail = load(uid, id);
-            if (detail == null) {
-                detail = getOrCreate(uid, id, record.getContent());
+        return withRedisLock(uid, id, () -> {
+            synchronized (lockFor(uid, id)) {
+                SessionDetail detail = load(uid, id);
+                if (detail == null) {
+                    // 已删除的会话不再 getOrCreate，避免 SSE 收尾把幽灵会话写回来
+                    log.warn("跳过追加：会话不存在 session={}", id);
+                    return false;
+                }
+                detail.getMessages().add(record);
+                writeDetail(uid, detail, record);
+                return true;
             }
-            detail.getMessages().add(record);
-            detail.setUpdatedAt(Instant.now());
-            // 仅当这是整段历史里的第一条 user 消息时改标题，避免后续提问把标题冲掉
-            if ("user".equals(record.getRole())
-                    && detail.getMessages().stream().filter(m -> "user".equals(m.getRole())).count() == 1) {
-                detail.setTitle(buildTitle(record.getContent()));
+        });
+    }
+
+    /**
+     * 用最终回复覆盖最后一条助手消息。HITL 中断已经写过「等待审批」，
+     * 续跑成功不应再 append 一条，刷新后才会是同一条气泡。
+     */
+    public boolean completeLastAssistant(String userId, String sessionId, ChatMessageRecord record) {
+        String uid = UserIds.normalize(userId);
+        String id = SessionIds.requireValid(sessionId);
+        return withRedisLock(uid, id, () -> {
+            synchronized (lockFor(uid, id)) {
+                SessionDetail detail = load(uid, id);
+                if (detail == null || detail.getMessages() == null || detail.getMessages().isEmpty()) {
+                    return false;
+                }
+                ChatMessageRecord last = detail.getMessages().get(detail.getMessages().size() - 1);
+                if (!"assistant".equals(last.getRole())) {
+                    return false;
+                }
+                last.setContent(record.getContent());
+                last.setTimestamp(record.getTimestamp());
+                last.setEvents(record.getEvents() == null ? new ArrayList<>() : record.getEvents());
+                writeDetail(uid, detail, record);
+                return true;
             }
-            persist(uid, detail);
-            upsertIndex(uid, SessionSummary.builder()
-                    .id(detail.getId())
-                    .title(detail.getTitle())
-                    .preview(previewOf(record.getContent()))
-                    .updatedAt(detail.getUpdatedAt())
-                    .messageCount(detail.getMessages().size())
-                    .build());
+        });
+    }
+
+    private void writeDetail(String uid, SessionDetail detail, ChatMessageRecord record) {
+        detail.setUpdatedAt(Instant.now());
+        if ("user".equals(record.getRole())
+                && detail.getMessages().stream().filter(m -> "user".equals(m.getRole())).count() == 1) {
+            detail.setTitle(buildTitle(record.getContent()));
         }
+        persist(uid, detail);
+        upsertIndex(uid, SessionSummary.builder()
+                .id(detail.getId())
+                .title(detail.getTitle())
+                .preview(previewOf(record.getContent()))
+                .updatedAt(detail.getUpdatedAt())
+                .messageCount(detail.getMessages().size())
+                .build());
     }
 
     /**
@@ -269,17 +351,20 @@ public class SessionStore {
     public boolean delete(String userId, String sessionId) {
         String uid = UserIds.normalize(userId);
         String id = SessionIds.requireValid(sessionId);
-        synchronized (lockFor(uid, id)) {
-            redis.del(sessionKey(uid, id));
-            boolean removed;
-            synchronized (indexLockFor(uid)) {
-                List<SessionSummary> index = readIndex(uid);
-                removed = index.removeIf(s -> Objects.equals(s.getId(), id));
-                writeIndex(uid, index);
+        boolean removed = withRedisLock(uid, id, () -> {
+            synchronized (lockFor(uid, id)) {
+                redis.del(sessionKey(uid, id));
+                synchronized (indexLockFor(uid)) {
+                    List<SessionSummary> index = readIndex(uid);
+                    boolean ok = index.removeIf(s -> Objects.equals(s.getId(), id));
+                    writeIndex(uid, index);
+                    return ok;
+                }
             }
-            fileLocks.remove(key(uid, id));
-            return removed;
-        }
+        });
+        // 必须出 synchronized 再摘锁对象，否则并发线程会拿到新锁并和本方法重叠
+        fileLocks.remove(key(uid, id));
+        return removed;
     }
 
     /** Redis GET + 反序列化。key 不存在或 JSON 坏了都当没有这条会话。 */
@@ -296,12 +381,14 @@ public class SessionStore {
         }
     }
 
-    /** 整份 SessionDetail 覆盖写回 Redis。序列化失败只打 warn，避免一次坏消息拖死整轮对话。 */
+    /** 整份 SessionDetail 覆盖写回 Redis。失败抛出去，避免 SSE 成功、刷新后消息没了。 */
     private void persist(String userId, SessionDetail detail) {
         try {
-            redis.set(sessionKey(userId, detail.getId()), mapper.writeValueAsString(detail));
+            String sk = sessionKey(userId, detail.getId());
+            redis.set(sk, mapper.writeValueAsString(detail));
+            redis.expire(sk, SESSION_TTL_SECONDS);
         } catch (Exception e) {
-            log.warn("写入会话失败: {}", e.getMessage());
+            throw new IllegalStateException("写入会话失败: " + e.getMessage(), e);
         }
     }
 
@@ -315,16 +402,19 @@ public class SessionStore {
             return mapper.readValue(json, new TypeReference<>() {
             });
         } catch (Exception e) {
+            log.warn("会话索引损坏，按空列表处理: {}", e.getMessage());
             return new ArrayList<>();
         }
     }
 
-    /** 覆盖写侧栏索引 JSON。失败只打 warn，会话全文已经 persist 过，索引可下次 upsert 修复。 */
+    /** 覆盖写侧栏索引 JSON。 */
     private void writeIndex(String userId, List<SessionSummary> data) {
         try {
-            redis.set(indexKey(userId), mapper.writeValueAsString(data));
+            String ik = indexKey(userId);
+            redis.set(ik, mapper.writeValueAsString(data));
+            redis.expire(ik, SESSION_TTL_SECONDS);
         } catch (Exception e) {
-            log.warn("写入会话索引失败: {}", e.getMessage());
+            throw new IllegalStateException("写入会话索引失败: " + e.getMessage(), e);
         }
     }
 

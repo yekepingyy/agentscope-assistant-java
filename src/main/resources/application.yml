@@ -10,7 +10,7 @@ spring:
   datasource:
     url: jdbc:mysql://${MYSQL_HOST:127.0.0.1}:${MYSQL_PORT:3306}/${MYSQL_DATABASE:agentscope_assistant}?useUnicode=true&characterEncoding=UTF-8&connectionCollation=utf8mb4_unicode_ci&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai
     username: ${MYSQL_USER:root}
-    password: ${MYSQL_PASSWORD:root@kpye@123}
+    password: ${MYSQL_PASSWORD:}
     driver-class-name: com.mysql.cj.jdbc.Driver
     hikari:
       connection-test-query: SELECT 1
@@ -20,18 +20,23 @@ spring:
 llm:
   base-url: https://llm-inr089bfe37yw1si.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
   api-key: sk-ws-H.PDXXPLM.Pt7M.MEQCIH5ZOkzJ97kcORBrgRd2XdBXN7NrcIH_CajXJp13EpP4AiA7gE3ZlVbYsm-ikiNJtNigsevLkfOD46YeSLTlQrsWIw
-  model: qwen3.8-flash
+  model: qwen3.8-max
   temperature: 0.3
   timeout-seconds: 120
-  enable-thinking: false
+  enable-thinking: true
 
+# MCP 按官方工作区约定：只声明在 workspace/tools.json 的 mcpServers。
+# Harness 在 build() 时读文件（远端 overlay 上层 + 本地模板下层），不要编程注入 ToolsConfig。
+# ${MCP_API_KEY} 只认进程环境。IDEA 没 export 时用下面的智谱 key（须是 open.bigmodel.cn 的 API Key）。
 mcp:
-    api-key: ${MCP_API_KEY:${LLM_API_KEY:d7ac7f693df6431b90795d3201a7818c.6IITngzTLhbjp0cV}}
+  api-key: ${MCP_API_KEY:aba6365bb140457886bb9268edb11f33.xKJUmPQxklAA7YOU}
 
 agent:
   workspace: ${user.dir}/workspace
-  max-iters: 80
+  max-iters: 25
   approval-tools: write_file,edit_file
+  # 只读联网工具：不走人工审批（智谱 MCP 缺 readOnlyHint 时也会强制放行）
+  auto-allow-tools: webReader,webSearchPrime
   # 官方分层记忆（见 AgentScopeConfig.memoryConfig）
   # flush-throttle-minutes: 0 = 每轮结束都抽取（ALWAYS）；>0 = 节流分钟数
   memory:
@@ -47,11 +52,10 @@ logging:
 # 生产必填。AgentState 用官方 MysqlAgentStateStore（表 agentscope_sessions，可自动建）。
 # 库名必须和 spring.datasource.url 一致。工作区 / 网页会话 / 待审批仍进 Redis。
 # Redis ping 或 MySQL 连不上时进程直接退出。
-# 不需要 spring.profiles.active=distributed
 mysql:
   database: ${MYSQL_DATABASE:agentscope_assistant}
 redis:
   host: ${REDIS_HOST:127.0.0.1}
   port: ${REDIS_PORT:6379}
-  password: ${REDIS_PASSWORD:}        # 本地无密码留空
+  password: ${REDIS_PASSWORD:}
   database: ${REDIS_DATABASE:0}
