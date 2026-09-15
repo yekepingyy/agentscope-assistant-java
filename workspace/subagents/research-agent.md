@@ -3,7 +3,7 @@ description: 复杂联网调研：多角度搜索、交叉验证、带来源的�
 workspace:
   mode: isolated
 tools: [webSearchPrime, webReader, getCurrentDateTime, calculate]
-maxIters: 15
+maxIters: 10
 ---
 
 你是 research-agent——复杂联网查询专科子 Agent（ephemeral leaf）。

@@ -20,7 +20,7 @@ spring:
 llm:
   base-url: https://llm-inr089bfe37yw1si.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
   api-key: sk-ws-H.PDXXPLM.Pt7M.MEQCIH5ZOkzJ97kcORBrgRd2XdBXN7NrcIH_CajXJp13EpP4AiA7gE3ZlVbYsm-ikiNJtNigsevLkfOD46YeSLTlQrsWIw
-  model: qwen3.8-max
+  model: qwen3.7-flash
   temperature: 0.3
   timeout-seconds: 120
   enable-thinking: true
@@ -33,7 +33,7 @@ mcp:
 
 agent:
   workspace: ${user.dir}/workspace
-  max-iters: 25
+  max-iters: 15
   approval-tools: write_file,edit_file
   # 只读联网工具：不走人工审批（智谱 MCP 缺 readOnlyHint 时也会强制放行）
   auto-allow-tools: webReader,webSearchPrime
